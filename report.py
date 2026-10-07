@@ -42,6 +42,8 @@ if not rows:
 # impl -> conns -> [rps]
 data = defaultdict(lambda: defaultdict(list))
 cpu = defaultdict(dict)
+cli = defaultdict(dict)
+nworkers = 1
 failed = []
 for r in rows:
     try:
@@ -53,6 +55,10 @@ for r in rows:
         data[impl][conns].append(rps)
         if r.get("server_cpu_pct") and r["server_cpu_pct"] != "NA":
             cpu[impl][conns] = float(r["server_cpu_pct"])
+        if r.get("client_cpu_pct") and r["client_cpu_pct"] != "NA":
+            cli[impl][conns] = float(r["client_cpu_pct"])
+        if r.get("workers"):
+            nworkers = int(r["workers"])
     except (ValueError, KeyError, TypeError):
         continue
 
@@ -107,6 +113,29 @@ sat = [v for i in cpu for v in cpu[i].values()]
 if sat:
     print(f"\nserver CPU: min {min(sat):.1f}%  max {max(sat):.1f}%  "
           f"(median run {'saturated' if min(sat) >= 95 else 'NOT saturated everywhere'})")
+
+# The server being pegged shows it is busy; it does NOT prove the load
+# generator is keeping up. A saturated client would cap throughput just as
+# effectively, so report it alongside. Values are summed over worker
+# processes, so 400% with 4 workers means every worker was pegged.
+ccli = [v for i in cli for v in cli[i].values()]
+if ccli:
+    # Each worker is pinned to its own core, so n workers can absorb at most
+    # n*100% before the load generator itself becomes the limiter.
+    ceiling = 100.0 * nworkers
+    peak = max(ccli)
+    if peak >= ceiling * 0.95:
+        # Client is at its ceiling, but that alone does not make it the
+        # limiter: if the server is also saturated, adding client workers
+        # raises the ceiling without raising throughput, which means the
+        # server is what caps the result. Both readings are reported.
+        verdict = ("client at ceiling AND server saturated -> server-limited "
+                   "(raising WORKERS does not raise throughput)")
+    else:
+        verdict = "client has headroom -> server-limited"
+    print(f"client CPU: {min(ccli):.0f}-{peak:.0f}% summed over {nworkers} worker(s)"
+          f" (ceiling {ceiling:.0f}%)")
+    print(f"  {verdict}")
 
 # Syscalls come from the separate strace file; skipped entirely when not asked for.
 if not STRACE:

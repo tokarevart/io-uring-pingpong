@@ -15,7 +15,7 @@ rings, and batching**.
 
 ```bash
 make                 # build all three binaries into build/
-make bench           # timing matrix + syscall pass, then the table (~23s total)
+make bench           # timing matrix + syscall pass, then the table (~24s total)
 make report          # re-print the table from existing CSVs (instant, no re-run)
 make strace          # re-run only the syscall-counting pass, then report
 ```
@@ -208,7 +208,7 @@ SMT on, sibling pairs adjacent):
 | role | cpus |
 |---|---|
 | server (single-threaded) | `0` |
-| client workers | `2`–`15` |
+| client workers | `2`, `4`, `6`, `8` |
 
 `cpu1` is the **SMT sibling of `cpu0`** and is deliberately excluded from the
 client set. Sharing a physical core between a saturated server and the load
@@ -222,6 +222,11 @@ generator pollutes both measurements. The sibling map is read at runtime from
   server scales.
 - **4 worker processes**, each owning a disjoint slice of connections and each
   pinning itself via `sched_setaffinity`. Parent aggregates counts over a pipe.
+- Workers are pinned to **one logical cpu per physical core** (`cpu_base` with a
+  stride of 2). SMT siblings here are adjacent pairs — `(0,1)`, `(2,3)` — so
+  handing out consecutive cpus would put two workers on one core.
+- Reports its own CPU as a percentage of one core, summed over workers, so the
+  harness can confirm the load generator is not itself the bottleneck.
 - Non-blocking connect with a `POLLOUT` wait, so N connections are established
   concurrently instead of serialising on handshakes.
 - **The measurement window starts only after every connection is up.** Socket
@@ -257,9 +262,9 @@ Every run records server CPU utilisation (`utime+stime` from
 - **3s** measurement window
 - **1 run** per point
 
-A 3s window is enough: the effect is ~45% while measured run-to-run standard
-deviation is 1.6% (epoll) and 3.4% (io_uring) — an order of magnitude below the
-effect size.
+A 3s window is enough: the effect is ~45% while the worst measured run-to-run
+standard deviation is 2.27% — a ~20x margin. Per-cell variation is tabulated in
+[`RESULTS.md`](RESULTS.md).
 
 Raise `RUNS` for tighter bounds; the report then shows the **median** across
 repeats and states how many runs went into each point (or `mixed run counts` if
@@ -277,7 +282,7 @@ self-describing when compared across machines.
 
 | file | contents |
 |---|---|
-| `results/bench.csv` | `impl,conns,run,completed,elapsed,rps,server_cpu_pct` |
+| `results/bench.csv` | `impl,conns,run,completed,elapsed,rps,server_cpu_pct,client_cpu_pct,workers` |
 | `results/bench_strace.csv` | `impl,conns,completed,elapsed,syscalls` |
 | `results/strace_<impl>_<conns>.txt` | raw `strace -c` reports |
 | `results/env.txt` | environment + settings for the run |
@@ -312,12 +317,12 @@ Headline, on this box:
 
 | | epoll | io_uring |
 |---|---:|---:|
-| throughput @512 conns | 107,522 rps | **147,091 rps** (1.37x) |
-| syscalls per transaction | 2.043 | **0.0260** (~79x fewer) |
-| `read`/`write` in hot path | 12,587 | **0** |
+| throughput @512 conns | 106,043 rps | **152,482 rps** (1.44x) |
+| syscalls per transaction | 2.041 | **0.0261** (~78x fewer) |
+| `read`/`write` in hot path | 12,706 | **0** |
 
-Server CPU was 99.0–101.0% in every run, so the server was the bottleneck
-throughout.
+Server CPU was 99.3–101.3% in every run, and the client had headroom at 64 and
+512 connections, so the server was the bottleneck throughout.
 
 ---
 

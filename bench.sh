@@ -88,7 +88,7 @@ if [ "$RUN_TIMING" = "1" ]; then
     # start from a clean file. Set APPEND=1 to merge, or RESULTS_CSV= to
     # redirect (which is how bench-quick avoids clobbering recorded data).
     if [ "${APPEND:-0}" != "1" ] || [ ! -f "$CSV" ]; then
-        echo "impl,conns,run,completed,elapsed,rps,server_cpu_pct" > "$CSV"
+        echo "impl,conns,run,completed,elapsed,rps,server_cpu_pct,client_cpu_pct,workers" > "$CSV"
     fi
     echo "writing to $CSV"
 fi
@@ -168,10 +168,23 @@ run_once() {
         >/dev/null 2>&1 &
     CURRENT_SRV_BG_PID=$!
     sleep 0.05
-    # match on the unique "<binary> <port> " prefix of the full cmdline
-    srv_pid=$(pgrep -f "${srv_bin} ${port} " | head -1)
-    if [ -z "$srv_pid" ]; then
-        echo "  !! could not resolve server pid for $srv_bin on port $port" >&2
+    # Prefer $!: taskset execs the server, so this is the server's own pid.
+    # pgrep is only a fallback, and it is racy right after launch, so poll for
+    # it briefly rather than reporting a spurious failure when exec is slow.
+    srv_pid="$CURRENT_SRV_BG_PID"
+    tries=0
+    while [ "$tries" -lt 50 ]; do
+        found=$(pgrep -f "${srv_bin} ${port} " | head -1)
+        if [ -n "$found" ]; then
+            srv_pid="$found"
+            break
+        fi
+        kill -0 "$srv_pid" 2>/dev/null || break
+        sleep 0.02
+        tries=$((tries + 1))
+    done
+    if ! kill -0 "$srv_pid" 2>/dev/null; then
+        echo "  !! server for $srv_bin on port $port did not start" >&2
         srv_pid=0
     fi
     CURRENT_SRV_PID="$srv_pid"
@@ -241,6 +254,9 @@ run_once() {
     RUN_COMPLETED=$(echo "$res" | awk '{print $1}')
     RUN_ELAPSED=$(echo "$res" | awk '{print $2}')
     RUN_CPU_PCT="$cpu_pct"
+    # client CPU as % of one core; sum over workers, so 400% means all 4 pegged
+    RUN_CLIENT_CPU=$(echo "$res" | awk '{print $3}')
+    [ -z "$RUN_CLIENT_CPU" ] && RUN_CLIENT_CPU=0
     RUN_SYSCALLS="${syscalls:-NA}"
 }
 
@@ -299,6 +315,7 @@ for impl in $IMPLS; do
             completed="$RUN_COMPLETED"
             elapsed="$RUN_ELAPSED"
             cpu_pct="$RUN_CPU_PCT"
+            client_cpu="$RUN_CLIENT_CPU"
             [ -z "$completed" ] && completed=0
             [ -z "$elapsed" ] && elapsed=0
 
@@ -316,15 +333,16 @@ for impl in $IMPLS; do
 
         for run in $(seq 1 "$RUNS"); do
             rps=$(awk -v c="$completed" -v t="$elapsed" 'BEGIN{if(t>0)printf "%.1f",c/t;else print 0}')
-            echo "$impl,$conns,$run,$completed,$elapsed,$rps,$cpu_pct" >> "$CSV"
-            printf "  %-5s conns=%-5s run=%s completed=%-9s rps=%-9s srv_cpu=%s%%\n" \
-                "$impl" "$conns" "$run" "$completed" "$rps" "$cpu_pct"
+            echo "$impl,$conns,$run,$completed,$elapsed,$rps,$cpu_pct,$client_cpu,$WORKERS" >> "$CSV"
+            printf "  %-5s conns=%-5s run=%s completed=%-9s rps=%-9s srv_cpu=%s%% cli_cpu=%s%%\n" \
+                "$impl" "$conns" "$run" "$completed" "$rps" "$cpu_pct" "$client_cpu"
             # more than one sample per point: re-measure each time
             if [ "$run" -lt "$RUNS" ]; then
                 run_once "$impl" "$conns" "$port" "$DURATION"
                 completed="$RUN_COMPLETED"
                 elapsed="$RUN_ELAPSED"
                 cpu_pct="$RUN_CPU_PCT"
+                client_cpu="$RUN_CLIENT_CPU"
             fi
         done
     done

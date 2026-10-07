@@ -50,6 +50,7 @@ struct worker_cfg {
 struct worker_result {
     long long completed;
     long long elapsed_ns;
+    long long cpu_ticks; /* self utime+stime, in clock ticks */
     int connected;
     int requested;
 };
@@ -61,7 +62,8 @@ usage(const char *prog) {
         "usage: %s <host> <port> <conns> <msgs_per_conn> <msg_size>\n"
         "          [duration_sec] [nodelay=1] [workers=auto] [cpu_base=1]\n"
         "\n"
-        "Prints a single line: '<total_completed> <measurement_seconds>'.\n"
+        "Prints a single line:\n"
+        "  '<total_completed> <measurement_seconds> <client_cpu_percent_of_one_core>'\n"
         "The measurement window starts only after every connection is\n"
         "established, so connection setup is excluded from the reported rate.\n"
         "msgs_per_conn < 0 means run until the duration expires.\n"
@@ -73,6 +75,42 @@ usage(const char *prog) {
 static double
 now_sec(const struct timespec *ts) {
     return (double)ts->tv_sec + (double)ts->tv_nsec / 1e9;
+}
+
+/* Process CPU used so far, in clock ticks (sysconf(_SC_CLK_TCK) per second).
+ *
+ * /proc/self/stat is "pid (comm) state ...", and comm may itself contain
+ * spaces or parens, so the numeric fields are located from the LAST ')'
+ * rather than by splitting the whole line on whitespace.
+ */
+static long long
+self_cpu_ticks(void) {
+    FILE *f = fopen("/proc/self/stat", "r");
+    if (!f) {
+        return 0;
+    }
+    static char buf[4096];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+
+    char *p = strrchr(buf, ')');
+    if (!p) {
+        return 0;
+    }
+    /* after ") " comes state=field 3, so utime=field 14 is the 12th token */
+    int field = 2;
+    long long utime = 0, stime = 0;
+    for (char *tok = strtok(p + 1, " "); tok; tok = strtok(NULL, " ")) {
+        field++;
+        if (field == 14) {
+            utime = strtoll(tok, NULL, 10);
+        } else if (field == 15) {
+            stime = strtoll(tok, NULL, 10);
+            break;
+        }
+    }
+    return utime + stime;
 }
 
 static int
@@ -153,6 +191,9 @@ run_worker(const struct worker_cfg *cfg, struct worker_result *out) {
      * rate in proportion to how many connections were opened. */
     struct timespec ready;
     clock_gettime(CLOCK_MONOTONIC, &ready);
+    /* CPU from here on is what competes with the server, so connection setup
+     * is excluded -- same window the server-side figure is measured over. */
+    long long ready_ticks = self_cpu_ticks();
 
     long long completed = 0;
     long long per_conn_limit = cfg->msgs_per_conn;
@@ -240,6 +281,7 @@ run_worker(const struct worker_cfg *cfg, struct worker_result *out) {
     out->completed = completed;
     out->elapsed_ns =
         (long long)((done.tv_sec - ready.tv_sec) * 1000000000LL + (done.tv_nsec - ready.tv_nsec));
+    out->cpu_ticks = self_cpu_ticks() - ready_ticks;
     out->connected = established;
     out->requested = cfg->count;
 
@@ -275,16 +317,43 @@ main(int argc, char **argv) {
     if (ncpu < 1) {
         ncpu = 1;
     }
-    int cpus_avail = (int)ncpu - cpu_base;
-    if (cpus_avail < 1) {
-        cpus_avail = 1;
+    /* Build the worker's cpu list, one logical cpu per physical core.
+     *
+     * SMT siblings are adjacent pairs on this box ((0,1),(2,3),...), so handing
+     * out cpu_base, cpu_base+1, ... would put two workers on the SAME physical
+     * core while leaving other cores idle. Striding by 2 avoids that.
+     */
+    int *cpu_list = malloc((size_t)ncpu * sizeof(int));
+    int cpu_count = 0;
+    if (!cpu_list) {
+        perror("malloc");
+        return 1;
     }
+    for (long c = cpu_base; c < ncpu && cpu_count < ncpu; c += 2) {
+        cpu_list[cpu_count++] = (int)c;
+    }
+    if (cpu_count < 1) {
+        fprintf(stderr, "no usable cpus from base %d (ncpu=%ld)\n", cpu_base, ncpu);
+        free(cpu_list);
+        return 1;
+    }
+
     if (workers <= 0) {
-        /* One worker per available cpu, but never more workers than conns. */
-        workers = cpus_avail;
+        /* One worker per physical core available, never more than conns. */
+        workers = cpu_count;
         if (workers > conns) {
             workers = conns;
         }
+    }
+    if (workers > cpu_count) {
+        fprintf(
+            stderr,
+            "note: %d workers requested but only %d cpus from base %d; workers will "
+            "share cores\n",
+            workers,
+            cpu_count,
+            cpu_base
+        );
     }
 
     struct sockaddr_in addr;
@@ -319,7 +388,7 @@ main(int argc, char **argv) {
         cfgs[w].msgs_per_conn = msgs_per_conn;
         cfgs[w].msg_size = msg_size;
         cfgs[w].nodelay = nodelay;
-        cfgs[w].cpu = cpu_base + w;
+        cfgs[w].cpu = cpu_list[w % cpu_count];
         cfgs[w].duration = (double)duration;
 
         pid_t pid = fork();
@@ -344,6 +413,7 @@ main(int argc, char **argv) {
 
     long long total = 0;
     long long max_elapsed_ns = 0;
+    long long cpu_ticks = 0;
     int connected = 0;
     int requested = 0;
     for (int w = 0; w < workers; w++) {
@@ -353,6 +423,7 @@ main(int argc, char **argv) {
             total += r.completed;
             connected += r.connected;
             requested += r.requested;
+            cpu_ticks += r.cpu_ticks;
             if (r.elapsed_ns > max_elapsed_ns) {
                 max_elapsed_ns = r.elapsed_ns;
             }
@@ -380,8 +451,18 @@ main(int argc, char **argv) {
      * denominator for the summed transaction count. */
     double elapsed = (double)max_elapsed_ns / 1e9;
 
-    printf("%lld %.6f\n", total, elapsed);
+    /* Client CPU as a fraction of one core, so it is directly comparable to
+     * the server's server_cpu_pct. bench.sh uses this to prove the server --
+     * not the load generator -- is the bottleneck. */
+    double client_cpu_pct = 0.0;
+    long hz = sysconf(_SC_CLK_TCK);
+    if (hz > 0 && elapsed > 0.0) {
+        client_cpu_pct = (double)cpu_ticks / (hz * elapsed) * 100.0;
+    }
+
+    printf("%lld %.6f %.1f\n", total, elapsed, client_cpu_pct);
     free(cfgs);
     free(pids);
+    free(cpu_list);
     return 0;
 }
