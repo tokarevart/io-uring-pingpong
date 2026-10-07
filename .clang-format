@@ -1,0 +1,25 @@
+# Based on Google/Chromium as they are the closest base styles to Rust
+BasedOnStyle: Google
+
+# Rust-like Indentation
+IndentWidth: 4
+ColumnLimit: 100
+ContinuationIndentWidth: 4
+
+# Force return type to a line above the function name
+AlwaysBreakAfterReturnType: All
+
+# Block-style alignment (Common in Rust)
+AlignAfterOpenBracket: BlockIndent
+BinPackParameters: false
+BinPackArguments: false
+
+# Braces on the same line (Rust style)
+BreakBeforeBraces: Attach
+
+# Other Rust-like tweaks
+PointerAlignment: Right
+SpaceAfterCStyleCast: false
+
+# Force braces on control flow
+InsertBraces: true
