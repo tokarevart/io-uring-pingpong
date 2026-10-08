@@ -63,6 +63,9 @@ DURATION=${DURATION:-3}
 NODELAY=${NODELAY:-1}
 RUNS=${RUNS:-1}
 IMPLS=${IMPLS:-"epoll uring"}
+# Transports to sweep. "both" by default: the UDP mode is an additive experiment
+# in its own result files, so running both never mixes them.
+PROTO_LIST=${PROTO_LIST-"tcp udp"}
 # The strace pass counts syscalls, it does not measure throughput, so it gets a
 # shorter window: epoll still issues ~13k read/write calls in 1s, and the
 # syscalls-per-transaction ratio is scale-invariant.
@@ -84,19 +87,25 @@ mkdir -p "$OUTDIR"
 # run_strace_pass) so the two can never contaminate each other. An empty
 # CONNS_LIST means "timing pass only has nothing to do" -- used by `make
 # strace` -- and must leave bench.csv completely untouched, header included.
-CSV=${RESULTS_CSV:-"$OUTDIR/bench.csv"}
+# PROTO is the transport currently being swept. Set as a loop variable below;
+# defaulted here so run_once is safe to call outside the sweep.
+PROTO=${PROTO:-tcp}
 RUN_TIMING=1
 [ -z "$CONNS_LIST" ] && RUN_TIMING=0
 
-if [ "$RUN_TIMING" = "1" ]; then
-    # Each invocation of the full matrix is a self-contained experiment, so
-    # start from a clean file. Set APPEND=1 to merge, or RESULTS_CSV= to
-    # redirect (which is how bench-quick avoids clobbering recorded data).
-    if [ "${APPEND:-0}" != "1" ] || [ ! -f "$CSV" ]; then
-        echo "impl,conns,run,completed,elapsed,rps,server_cpu_pct,client_cpu_pct,workers" > "$CSV"
+# One result file per transport, so a udp point can never be averaged into the
+# tcp table. RESULTS_CSV still wins outright, which is how bench-quick keeps
+# its throwaway run out of the recorded data.
+csv_for() {
+    if [ -n "${RESULTS_CSV:-}" ]; then
+        echo "$RESULTS_CSV"
+    elif [ "$1" = "udp" ]; then
+        echo "$OUTDIR/udp.csv"
+    else
+        echo "$OUTDIR/bench.csv"
     fi
-    echo "writing to $CSV"
-fi
+}
+CSV=$(csv_for "$PROTO")
 
 # Resolve the SMT sibling of the server cpu so we can exclude it explicitly.
 server_sibling=$(cat "/sys/devices/system/cpu/cpu${SERVER_CPU}/topology/thread_siblings_list" 2>/dev/null || echo "$SERVER_CPU")
@@ -114,6 +123,7 @@ CLIENT_CPU_LIST="${CLIENT_CPU_BASE}-${LAST_CPU}"
     echo "gcc=$(gcc --version | head -1)"
     echo "liburing=$(ls /lib64/liburing.so.* 2>/dev/null | head -1 | xargs -r basename)"
     echo "runs=$RUNS duration_s=$DURATION warmup_s=$WARMUP workers=$WORKERS msg_size=$MSG_SIZE"
+    echo "protos=$PROTO_LIST"
     echo "server_cpu=$SERVER_CPU siblings=$server_sibling client_cpus=$CLIENT_CPU_LIST"
 } > "$OUTDIR/env.txt" 2>/dev/null || true
 
@@ -122,18 +132,35 @@ echo "server cpu=$SERVER_CPU siblings=$server_sibling client cpus=${CLIENT_CPU_L
 # distinct port range per impl so a lingering listener can't block the next run
 port_for() {
     local impl=$1 conns=$2
+    # udp gets its own band so a lingering socket from one mode cannot disturb
+    # the other mode's bind check. The band must keep the result inside 16 bits:
+    # both servers bind with htons((uint16_t)port), so a port above 65535 is
+    # silently truncated -- the client truncates identically and the run still
+    # works, but wait_port_listening then looks for a port nobody ever bound and
+    # spins out its whole timeout.
+    local band=0
+    [ "$PROTO" = "udp" ] && band=10000
+    local port
     if [ "$impl" = "uring" ]; then
-        echo $((PORT_START + 20000 + conns))
+        port=$((PORT_START + band + 20000 + conns))
     else
-        echo $((PORT_START + conns))
+        port=$((PORT_START + band + conns))
     fi
+    if [ "$port" -gt 65535 ]; then
+        echo "  !! $impl/$PROTO conns=$conns would use port $port (>65535)," \
+             "which htons() would truncate. Lower PORT_START/band." >&2
+        return 1
+    fi
+    echo "$port"
 }
 
 # Wait until nothing is listening on $1, so a just-killed server cannot make
 # the next run fail to bind.
 wait_port_free() {
     local port=$1 tries=0
-    while ss -tlnH "sport = :$port" 2>/dev/null | grep -q .; do
+    local filter="-tlnH"
+    [ "$PROTO" = "udp" ] && filter="-ulnH"
+    while ss $filter "sport = :$port" 2>/dev/null | grep -q .; do
         sleep 0.05
         tries=$((tries + 1))
         if [ "$tries" -gt 400 ]; then
@@ -146,7 +173,9 @@ wait_port_free() {
 # that was both slow and a race -- it only ever guessed the listener was up.
 wait_port_listening() {
     local port=$1 tries=0
-    while ! ss -tlnH "sport = :$port" 2>/dev/null | grep -q .; do
+    local filter="-tlnH"
+    [ "$PROTO" = "udp" ] && filter="-ulnH"
+    while ! ss $filter "sport = :$port" 2>/dev/null | grep -q .; do
         sleep 0.02
         tries=$((tries + 1))
         if [ "$tries" -gt 250 ]; then
@@ -169,21 +198,28 @@ run_once() {
     # Redirect the server's output explicitly. A background process that keeps an
     # inherited pipe open makes a $(...) substitution block forever waiting for
     # EOF, which is what turns Ctrl-C into a hang.
-    taskset -c "$SERVER_CPU" "$srv_bin" "$port" $((dur + 5)) 500000000 "$NODELAY" \
+    # Resolve the server pid without pgrep. $! is the pid of the backgrounded
+    # command; taskset execs the binary, so that same pid becomes the server.
+    # The only wrinkle is that bash sometimes wraps the command in a subshell,
+    # in which case $! starts out as comm=bash and only later becomes the
+    # server. So poll /proc/PID/comm until it names the binary we asked for,
+    # rather than searching by name -- a name search is not safe here, because
+    # the warmup and the measured run use the same port and can match each
+    # other's server, which silently samples the wrong process and reports
+    # server_cpu_pct as 0.0%.
+    local srv_name srv_pid tries
+    srv_name=$(basename "$srv_bin")
+
+    taskset -c "$SERVER_CPU" "$srv_bin" "$port" $((dur + 5)) 500000000 "$NODELAY" "$PROTO" \
         >/dev/null 2>&1 &
     CURRENT_SRV_BG_PID=$!
-    sleep 0.05
-    # Prefer $!: taskset execs the server, so this is the server's own pid.
-    # pgrep is only a fallback, and it is racy right after launch, so poll for
-    # it briefly rather than reporting a spurious failure when exec is slow.
     srv_pid="$CURRENT_SRV_BG_PID"
     tries=0
-    while [ "$tries" -lt 50 ]; do
-        found=$(pgrep -f "${srv_bin} ${port} " | head -1)
-        if [ -n "$found" ]; then
-            srv_pid="$found"
+    while [ "$tries" -lt 100 ]; do
+        if [ "$(cat "/proc/$srv_pid/comm" 2>/dev/null)" = "$srv_name" ]; then
             break
         fi
+        # the wrapper died without exec'ing: nothing was started
         kill -0 "$srv_pid" 2>/dev/null || break
         sleep 0.02
         tries=$((tries + 1))
@@ -197,7 +233,7 @@ run_once() {
     wait_port_listening "$port"
 
     if [ "${STRACE:-0}" = "1" ]; then
-        strace_out="$OUTDIR/strace_${impl}_${conns}.txt"
+        strace_out="$OUTDIR/strace_${impl}_${PROTO}_${conns}.txt"
         strace -c -o "$strace_out" -p "$srv_pid" >/dev/null 2>"$strace_out.attach" &
         strace_pid=$!
         CURRENT_STRACE_PID="$strace_pid"
@@ -225,7 +261,7 @@ run_once() {
     local res rc
     res=$( { timeout $((dur + 30)) taskset -c "$CLIENT_CPU_LIST" \
         ./build/pingpong_cli "$TARGET_HOST" "$port" "$conns" -1 "$MSG_SIZE" \
-        "$dur" "$NODELAY" "$WORKERS" "$CLIENT_CPU_BASE" 2>/dev/null | tail -1; \
+        "$dur" "$NODELAY" "$WORKERS" "$CLIENT_CPU_BASE" "$PROTO" 2>/dev/null | tail -1; \
         exit "${PIPESTATUS[0]}"; } )
     rc=$?
 
@@ -241,10 +277,25 @@ run_once() {
     fi
 
     kill "$srv_pid" 2>/dev/null
+    # SIGTERM is not guaranteed to land: a server parked inside io_uring_enter
+    # or epoll_wait can miss it and keep running until its own deadline. That
+    # is not cosmetic -- a lingering UDP socket still holds the port, and
+    # SO_REUSEADDR lets a *second* server bind over it on UDP (verified: two
+    # SO_REUSEADDR UDP sockets bind the same addr:port), which silently splits
+    # traffic between two processes and leaves this run's pid measurement
+    # pointing at a stale process. Escalate, then reap.
+    for _ in $(seq 1 100); do
+        kill -0 "$srv_pid" 2>/dev/null || break
+        sleep 0.02
+    done
+    kill -KILL "$srv_pid" 2>/dev/null
     wait "$srv_pid" 2>/dev/null
     CURRENT_SRV_PID=""
     CURRENT_SRV_BG_PID=""
-    wait_port_free "$port"
+    if ! wait_port_free "$port"; then
+        echo "  !! port $port still bound after killing the server; the next point" \
+             "may share the port" >&2
+    fi
 
     # ticks are 1/100s; the server runs a little longer than the client window
     local cpu_pct
@@ -287,9 +338,11 @@ run_once() {
 # throughput data or it would drag the rates down.
 run_strace_pass() {
     local STRACE=1
-    local scsv="$OUTDIR/bench_strace.csv"
-    # drop stale reports so a failed pass can never leave old counts looking current
-    rm -f "$OUTDIR"/strace_*.txt "$OUTDIR"/strace_*.txt.attach
+    local scsv="$OUTDIR/$( [ "$PROTO" = "udp" ] && echo udp_strace.csv || echo bench_strace.csv )"
+    # Drop stale reports for *this transport only*, so a failed pass cannot
+    # leave old counts looking current -- but so the other transport's reports
+    # survive, since each proto runs its own pass.
+    rm -f "$OUTDIR"/strace_*_"$PROTO"_*.txt "$OUTDIR"/strace_*_"$PROTO"_*.txt.attach
     echo "impl,conns,completed,elapsed,syscalls" > "$scsv"
     for impl in $IMPLS; do
         local port
@@ -313,109 +366,128 @@ run_strace_pass() {
     done
 }
 
-# Timing pass, then a short strace pass so syscall counts are always available.
-# The warmup runs once per implementation (at the smallest conn count) rather
-# than per point: every run starts a *fresh* server, so a per-point warmup only
-# re-warms global state -- caches, slabs, TCP structures -- and measuring in
-# ascending order leaves the heaviest point measured last, fully warm.
-if [ "$RUN_TIMING" = "1" ]; then
-# Set when a point failed content verification. Stopping the whole sweep is
-# deliberate: a server returning wrong data makes every other number from the
-# run suspect, so continuing would only produce more implausible-looking data.
-INVALID=0
-for impl in $IMPLS; do
-    warmed=0
-    for conns in $CONNS_LIST; do
-        port=$(port_for "$impl" "$conns")
-        if [ "$warmed" -eq 0 ]; then
-            run_once "$impl" "$conns" "$port" "$WARMUP" >/dev/null # discarded
-            warmed=1
+# Sweep every transport. Each writes its own result files, so a udp point can
+# never be averaged into the tcp table -- the two are different workloads and
+# their rps are not comparable.
+for PROTO in $PROTO_LIST; do
+    CSV=$(csv_for "$PROTO")
+    echo "=== proto: $PROTO ==="
+
+    if [ "$RUN_TIMING" = "1" ]; then
+        # Each invocation of the full matrix is a self-contained experiment, so
+        # start from a clean file. Set APPEND=1 to merge, or RESULTS_CSV= to
+        # redirect (which is how bench-quick avoids clobbering recorded data).
+        if [ "${APPEND:-0}" != "1" ] || [ ! -f "$CSV" ]; then
+            echo "impl,conns,run,completed,elapsed,rps,server_cpu_pct,client_cpu_pct,workers" > "$CSV"
         fi
+        echo "writing to $CSV"
+    fi
 
-        # A point can occasionally come back with 0 completed (a port that has
-        # not finished releasing, or a connection burst that outlives the
-        # accept queue). Retry rather than record a bogus zero.
-        attempt=0
-        while :; do
-            run_once "$impl" "$conns" "$port" "$DURATION"
-completed="$RUN_COMPLETED"
-            elapsed="$RUN_ELAPSED"
-            cpu_pct="$RUN_CPU_PCT"
-            client_cpu="$RUN_CLIENT_CPU"
-            mismatches="$RUN_MISMATCHES"
-            [ -z "$completed" ] && completed=0
-            [ -z "$elapsed" ] && elapsed=0
-
-            # Wrong echo content is not retried: unlike a zero-transaction
-            # point, which is usually a port still releasing, corruption is a
-            # property of the server under test. Retrying would just hide it.
-            if [ "${mismatches:-0}" -ne 0 ]; then
-                echo "  !! $impl conns=$conns: $mismatches echoes had wrong content;" \
-                     "run is INVALID and will not be recorded" >&2
-                INVALID=1
-                break
+    # Timing pass, then a short strace pass so syscall counts are always
+    # available. The warmup runs once per implementation (at the smallest conn
+    # count) rather than per point: every run starts a *fresh* server, so a
+    # per-point warmup only re-warms global state -- caches, slabs, TCP/UDP
+    # structures -- and measuring in ascending order leaves the heaviest point
+    # measured last, fully warm.
+    if [ "$RUN_TIMING" = "1" ]; then
+    # Set when a point failed content verification. Stopping the whole sweep is
+    # deliberate: a server returning wrong data makes every other number from
+    # the run suspect, so continuing would only produce more implausible data.
+    INVALID=0
+    for impl in $IMPLS; do
+        warmed=0
+        for conns in $CONNS_LIST; do
+            port=$(port_for "$impl" "$conns")
+            if [ "$warmed" -eq 0 ]; then
+                run_once "$impl" "$conns" "$port" "$WARMUP" >/dev/null # discarded
+                warmed=1
             fi
 
-            if [ "${completed:-0}" -gt 0 ]; then
-                break
-            fi
-            attempt=$((attempt + 1))
-            if [ "$attempt" -ge 3 ]; then
-                echo "  !! $impl conns=$conns: 0 completed after $attempt attempts" >&2
-                break
-            fi
-            echo "  .. $impl conns=$conns: 0 completed, retry $attempt/3" >&2
-            sleep 2
-        done
-
-        if [ "$INVALID" = "1" ]; then
-            break
-        fi
-
-        for run in $(seq 1 "$RUNS"); do
-            rps=$(awk -v c="$completed" -v t="$elapsed" 'BEGIN{if(t>0)printf "%.1f",c/t;else print 0}')
-            echo "$impl,$conns,$run,$completed,$elapsed,$rps,$cpu_pct,$client_cpu,$WORKERS" >> "$CSV"
-            printf "  %-5s conns=%-5s run=%s completed=%-9s rps=%-9s srv_cpu=%s%% cli_cpu=%s%%\n" \
-                "$impl" "$conns" "$run" "$completed" "$rps" "$cpu_pct" "$client_cpu"
-            # more than one sample per point: re-measure each time
-            if [ "$run" -lt "$RUNS" ]; then
+            # A point can occasionally come back with 0 completed (a port that
+            # has not finished releasing, or a connection burst that outruns
+            # the accept queue). Retry rather than record a bogus zero.
+            attempt=0
+            while :; do
                 run_once "$impl" "$conns" "$port" "$DURATION"
                 completed="$RUN_COMPLETED"
                 elapsed="$RUN_ELAPSED"
                 cpu_pct="$RUN_CPU_PCT"
                 client_cpu="$RUN_CLIENT_CPU"
-                # a repeat run that serves wrong data invalidates the point
-                # just as the first one would
-                if [ "${RUN_MISMATCHES:-0}" -ne 0 ]; then
-                    echo "  !! $impl conns=$conns: repeat run served wrong content;" \
-                         "point is INVALID and will not be recorded" >&2
+                mismatches="$RUN_MISMATCHES"
+                [ -z "$completed" ] && completed=0
+                [ -z "$elapsed" ] && elapsed=0
+
+                # Wrong echo content is not retried: unlike a zero-transaction
+                # point, which is usually a port still releasing, corruption is
+                # a property of the server under test. Retrying would hide it.
+                if [ "${mismatches:-0}" -ne 0 ]; then
+                    echo "  !! $impl $PROTO conns=$conns: $mismatches echoes had wrong" \
+                         "content; run is INVALID and will not be recorded" >&2
                     INVALID=1
                     break
                 fi
+
+                if [ "${completed:-0}" -gt 0 ]; then
+                    break
+                fi
+                attempt=$((attempt + 1))
+                if [ "$attempt" -ge 3 ]; then
+                    echo "  !! $impl $PROTO conns=$conns: 0 completed after $attempt attempts" >&2
+                    break
+                fi
+                echo "  .. $impl $PROTO conns=$conns: 0 completed, retry $attempt/3" >&2
+                sleep 2
+            done
+
+            if [ "$INVALID" = "1" ]; then
+                break
+            fi
+
+            for run in $(seq 1 "$RUNS"); do
+                rps=$(awk -v c="$completed" -v t="$elapsed" 'BEGIN{if(t>0)printf "%.1f",c/t;else print 0}')
+                echo "$impl,$conns,$run,$completed,$elapsed,$rps,$cpu_pct,$client_cpu,$WORKERS" >> "$CSV"
+                printf "  %-5s %-3s conns=%-5s run=%s completed=%-9s rps=%-9s srv_cpu=%s%% cli_cpu=%s%%\n" \
+                    "$impl" "$PROTO" "$conns" "$run" "$completed" "$rps" "$cpu_pct" "$client_cpu"
+                # more than one sample per point: re-measure each time
+                if [ "$run" -lt "$RUNS" ]; then
+                    run_once "$impl" "$conns" "$port" "$DURATION"
+                    completed="$RUN_COMPLETED"
+                    elapsed="$RUN_ELAPSED"
+                    cpu_pct="$RUN_CPU_PCT"
+                    client_cpu="$RUN_CLIENT_CPU"
+                    # a repeat run that serves wrong data invalidates the point
+                    # just as the first one would
+                    if [ "${RUN_MISMATCHES:-0}" -ne 0 ]; then
+                        echo "  !! $impl $PROTO conns=$conns: repeat run served wrong" \
+                             "content; point is INVALID and will not be recorded" >&2
+                        INVALID=1
+                        break
+                    fi
+                fi
+            done
+
+            if [ "$INVALID" = "1" ]; then
+                break
             fi
         done
-
-        if [ "$INVALID" = "1" ]; then
-            break
-        fi
+        [ "$INVALID" = "1" ] && break
     done
-    [ "$INVALID" = "1" ] && break
+
+    fi # RUN_TIMING
+
+    # A run that served wrong data is not evidence about throughput, so the
+    # strace pass is skipped too rather than quietly adding counts to the CSVs.
+    if [ "${INVALID:-0}" = "1" ]; then
+        echo "  !! ABORTED: content verification failed; no point from this run was" \
+             "recorded, and the strace pass was skipped" >&2
+        exit 1
+    fi
+
+    if [ "${SKIP_STRACE:-0}" != "1" ]; then
+        STRACE=1 run_strace_pass
+    fi
+
+    if [ "$RUN_TIMING" = "1" ]; then
+        echo "results written to $CSV"
+    fi
 done
-
-fi # RUN_TIMING
-
-# A run that served wrong data is not evidence about throughput, so the strace
-# pass is skipped too rather than quietly adding syscall counts to the CSVs.
-if [ "${INVALID:-0}" = "1" ]; then
-    echo "  !! ABORTED: content verification failed; no point from this run was" \
-         "recorded, and the strace pass was skipped" >&2
-    exit 1
-fi
-
-if [ "${SKIP_STRACE:-0}" != "1" ]; then
-    STRACE=1 run_strace_pass
-fi
-
-if [ "$RUN_TIMING" = "1" ]; then
-    echo "results written to $CSV"
-fi

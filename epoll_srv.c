@@ -53,19 +53,150 @@ now_sec(const struct timespec *ts) {
     return (double)ts->tv_sec + (double)ts->tv_nsec / 1e9;
 }
 
+/* Stateless UDP echo loop -- the control for the io_uring UDP mode.
+ *
+ * Deliberately the same shape as the io_uring side: one socket, no per-client
+ * state, nothing to set up beyond epoll_ctl. The only difference that matters
+ * is the two syscalls per datagram, recvfrom() and sendto(), which is exactly
+ * what the io_uring version replaces with a pair of SQEs.
+ *
+ * Counting matches the io_uring server: a transaction counts only when the
+ * echo has actually gone out.
+ */
+static long long
+run_udp_loop(int sock, int port, int duration_sec, long long msg_limit) {
+    (void)port;
+    const size_t bufsz = 64; /* must match MSG_SIZE in bench.sh */
+
+    int epfd = epoll_create1(0);
+    if (epfd < 0) {
+        perror("epoll_create1");
+        return 0;
+    }
+    struct epoll_event ev = {.events = EPOLLIN, .data.fd = sock};
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, sock, &ev) < 0) {
+        perror("epoll_ctl add");
+        close(epfd);
+        return 0;
+    }
+
+    uint8_t *buf = malloc(bufsz);
+    struct sockaddr_storage peer;
+    if (!buf) {
+        perror("malloc");
+        close(epfd);
+        return 0;
+    }
+
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    long long completed = 0;
+    long long errors = 0;
+    unsigned ticks = 0;
+    int stop = 0;
+
+    while (!stop) {
+        if (completed + errors >= msg_limit) {
+            break;
+        }
+        if (++ticks >= DEADLINE_CHECK_EVERY) {
+            ticks = 0;
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            if (duration_sec > 0 && now_sec(&now) - now_sec(&start) >= (double)duration_sec) {
+                break;
+            }
+        }
+
+        struct epoll_event evs[64];
+        int n = epoll_wait(epfd, evs, 64, 200);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            perror("epoll_wait");
+            break;
+        }
+        for (int i = 0; i < n; i++) {
+            if (!(evs[i].events & EPOLLIN)) {
+                continue;
+            }
+            /* Drain: a burst of datagrams must not be left queued behind us. */
+            for (;;) {
+                socklen_t plen = sizeof(peer);
+                ssize_t r =
+                    recvfrom(sock, buf, bufsz, MSG_DONTWAIT, (struct sockaddr *)&peer, &plen);
+                if (r < 0) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        break;
+                    }
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    errors++;
+                    break;
+                }
+                if ((size_t)r != bufsz) {
+                    /* short or oversized datagram; never echo a partial reply */
+                    errors++;
+                    continue;
+                }
+                ssize_t s =
+                    sendto(sock, buf, (size_t)r, MSG_DONTWAIT, (struct sockaddr *)&peer, plen);
+                if (s == (ssize_t)r) {
+                    completed++;
+                } else {
+                    errors++;
+                }
+            }
+        }
+    }
+
+    fprintf(stderr, "epoll_srv(udp): completed=%lld errors=%lld\n", completed, errors);
+    free(buf);
+    close(epfd);
+    return completed;
+}
+
 int
 main(int argc, char **argv) {
     if (argc < 4) {
-        fprintf(stderr, "usage: %s <port> <duration_sec> <msg_count_limit> [nodelay=1]\n", argv[0]);
+        fprintf(
+            stderr,
+            "usage: %s <port> <duration_sec> <msg_count_limit> [nodelay=1] [proto=tcp]\n",
+            argv[0]
+        );
         return 1;
     }
 
     int port = atoi(argv[1]);
+    /* Both sides bind with htons((uint16_t)port), so a port above 65535 is
+     * silently truncated rather than rejected. Client and server would truncate
+     * identically and the run would appear to work, while the harness's port
+     * checks looked for a port nobody ever bound. Fail loudly instead. */
+    if (port <= 0 || port > 65535) {
+        fprintf(stderr, "port %d out of range (1-65535)\n", port);
+        return 1;
+    }
     int duration_sec = atoi(argv[2]);
     long long msg_limit = atoll(argv[3]);
     int nodelay = (argc >= 5) ? atoi(argv[4]) : 1;
+    const char *proto = (argc >= 6) ? argv[5] : "tcp";
+    int is_udp;
+    if (strcmp(proto, "udp") == 0) {
+        is_udp = 1;
+    } else if (strcmp(proto, "tcp") == 0) {
+        is_udp = 0;
+    } else {
+        fprintf(stderr, "unknown proto '%s' (want tcp or udp)\n", proto);
+        return 1;
+    }
 
-    int listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    /* UDP mode dispatches to a separate loop: it has no connections, so every
+     * line below this point -- slots, fd indirection, partial writes, epoll_ctl
+     * churn -- would be dead code. */
+    int listen_fd = socket(AF_INET, is_udp ? SOCK_DGRAM : (SOCK_STREAM | SOCK_NONBLOCK), 0);
     if (listen_fd < 0) {
         perror("socket");
         return 1;
@@ -85,7 +216,14 @@ main(int argc, char **argv) {
         close(listen_fd);
         return 1;
     }
-    if (listen(listen_fd, 4096) < 0) {
+    if (is_udp) {
+        long long done = run_udp_loop(listen_fd, port, duration_sec, msg_limit);
+        (void)done;
+        close(listen_fd);
+        return 0;
+    }
+
+    if (!is_udp && listen(listen_fd, 4096) < 0) {
         perror("listen");
         close(listen_fd);
         return 1;

@@ -58,6 +58,7 @@ struct worker_cfg {
     long long msgs_per_conn;
     int msg_size;
     int nodelay;
+    int is_udp;
     int cpu;
     double duration;
 };
@@ -80,7 +81,7 @@ usage(const char *prog) {
     fprintf(
         stderr,
         "usage: %s <host> <port> <conns> <msgs_per_conn> <msg_size>\n"
-        "          [duration_sec] [nodelay=1] [workers=auto] [cpu_base=1]\n"
+        "          [duration_sec] [nodelay=1] [workers=auto] [cpu_base=1] [proto=tcp]\n"
         "\n"
         "Prints a single line:\n"
         "  '<total_completed> <measurement_seconds> <client_cpu_percent_of_one_core>"
@@ -160,14 +161,19 @@ make_tag(unsigned char *tag, uint64_t nonce, uint64_t conn_index, uint64_t seq) 
 }
 
 /* Non-blocking connect that waits for writability, so N connections can be
- * established quickly without serialising on the handshake. */
+ * established quickly without serialising on the handshake.
+ *
+ * For UDP the socket is SOCK_DGRAM and there is no handshake: connect() only
+ * sets a default peer and returns success immediately, so the poll-and-check
+ * path below is skipped entirely. TCP_NODELAY has no UDP equivalent and is not
+ * set -- UDP has no stream to coalesce. */
 static int
-connect_nb(const struct sockaddr_in *addr, int nodelay) {
-    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+connect_nb(const struct sockaddr_in *addr, int nodelay, int is_udp) {
+    int fd = socket(AF_INET, is_udp ? SOCK_DGRAM : (SOCK_STREAM | SOCK_NONBLOCK), 0);
     if (fd < 0) {
         return -1;
     }
-    if (nodelay) {
+    if (nodelay && !is_udp) {
         int one = 1;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     }
@@ -227,7 +233,7 @@ run_worker(const struct worker_cfg *cfg, struct worker_result *out) {
     long long mismatches = 0;
     int live = 0;
     for (int i = 0; i < cfg->count; i++) {
-        int fd = connect_nb(&cfg->addr, cfg->nodelay);
+        int fd = connect_nb(&cfg->addr, cfg->nodelay, cfg->is_udp);
         if (fd < 0) {
             continue;
         }
@@ -379,6 +385,16 @@ main(int argc, char **argv) {
     int nodelay = (argc >= 8) ? atoi(argv[7]) : 1;
     int workers = (argc >= 9) ? atoi(argv[8]) : 0;
     int cpu_base = (argc >= 10) ? atoi(argv[9]) : 1;
+    const char *proto = (argc >= 11) ? argv[10] : "tcp";
+    int is_udp;
+    if (strcmp(proto, "udp") == 0) {
+        is_udp = 1;
+    } else if (strcmp(proto, "tcp") == 0) {
+        is_udp = 0;
+    } else {
+        fprintf(stderr, "unknown proto '%s' (want tcp or udp)\n", proto);
+        return 1;
+    }
 
     if (conns <= 0 || msg_size <= 0) {
         usage(argv[0]);
@@ -460,6 +476,7 @@ main(int argc, char **argv) {
         cfgs[w].msgs_per_conn = msgs_per_conn;
         cfgs[w].msg_size = msg_size;
         cfgs[w].nodelay = nodelay;
+        cfgs[w].is_udp = is_udp;
         cfgs[w].cpu = cpu_list[w % cpu_count];
         cfgs[w].duration = (double)duration;
 

@@ -30,17 +30,20 @@ Relative standard deviation across the 3 runs behind each point:
 
 | conns | epoll | io_uring |
 |---:|---:|---:|
-| 64 | 1.72% | 0.45% |
-| 512 | 0.55% | 1.50% |
-| 4096 | 4.66% | 4.42% |
+| 64 | 1.91% | 1.14% |
+| 512 | 0.18% | 0.92% |
+| 4096 | 3.52% | 5.04% |
 
-Worst cell is **4.66%** (epoll at 4096), against a 38–54% effect — a 10x margin.
-The 4096 point is visibly the noisy one for **both** implementations (epoll
-104,666–114,898, uring 146,689–160,111): at that connection count the client
-sits at 98–100% of its 400% ceiling, so this point is the one most exposed to
-contention from the load generator itself. Absolute throughput on this shared VM
-drifts a few percent between full runs, so treat the speedup as the figure and
-the rps values as approximate.
+Worst cell is **5.04%** (io_uring at 4096), against a 38–42% effect — an 8x
+margin. The 4096 point is visibly the noisy one for **both** implementations
+(epoll 3.52%, io_uring 5.04%): at that connection count the client sits at
+98–100% of its 400% ceiling, so this point is the one most exposed to contention
+from the load generator itself. Absolute throughput on this shared VM drifts a
+few percent between full runs, so treat the speedup as the figure and the rps
+values as approximate.
+
+UDP is markedly quieter — worst cell 2.02%, and 0.18–1.38% at 64/512/4096 —
+because no connection setup or teardown happens inside the window at all.
 
 ---
 
@@ -104,11 +107,11 @@ gained throughput from the extra workers.
 
 | conns | epoll rps | io_uring rps | speedup |
 |------:|----------:|-------------:|--------:|
-| 64 | 94,222 | **144,766** | 1.54x |
-| 512 | 114,933 | **161,647** | 1.41x |
-| 4096 | 110,342 | **152,056** | 1.38x |
+| 64 | 91,609 | **130,123** | 1.42x |
+| 512 | 110,505 | **152,904** | 1.38x |
+| 4096 | 98,164 | **138,689** | 1.41x |
 
-**io_uring is 1.38x–1.54x faster across the whole sweep.**
+**io_uring is 1.38x–1.42x faster across the whole sweep.**
 
 ---
 
@@ -117,16 +120,16 @@ gained throughput from the extra workers.
 `strace -c` attached to the server, 64 connections, 1s window. A single point
 suffices because the *per-transaction* rate is stable across connection counts.
 
-**epoll** — 6,380 transactions in 1.0s, 13,037 syscalls
-**io_uring** — 108,560 transactions in 1.0s, 2,826 syscalls
+**epoll** — 6,022 transactions in 1.0s, 12,302 syscalls
+**io_uring** — 102,098 transactions in 1.0s, 2,653 syscalls
 
 | | epoll | io_uring |
 |---|---:|---:|
 | **syscalls per transaction** | **2.043** | **0.0260** |
 | `read`/`write` in hot path | one each per txn | **0** |
-| `io_uring_enter` | 0 | ~2,800 |
-| total | 13,037 | 2,826 |
-| transactions in the same window | 6,380 | **108,560** |
+| `io_uring_enter` | 0 | ~2,650 |
+| total | 12,302 | 2,653 |
+| transactions in the same window | 6,022 | **102,098** |
 
 **~79x fewer syscalls per transaction**, and 4.6x fewer in total over a window
 long enough to compare rates fairly.
@@ -139,9 +142,101 @@ rings.
 Under `strace`, which penalises syscall entry/exit heavily, `io_uring` served
 **17.0x** more transactions than `epoll` in the same wall-clock window.
 
+The strace files are `results/bench_strace.csv` (tcp) and
+`results/udp_strace.csv` (udp); each pass cleans up only its own raw reports,
+so one transport can never delete the other's evidence.
+
 ---
 
-## Where the time actually goes
+## UDP: same design, much smaller win
+
+The second transport (`results/udp.csv`, run with `PROTO_LIST=udp`). Both sides
+are stateless — one socket, no accept/connect/close, nothing per client — so the
+comparison isolates the syscall tax and nothing else. 3 runs per point, medians.
+
+| conns | epoll rps | io_uring rps | speedup |
+|------:|----------:|-------------:|--------:|
+| 64 | 154,397 | **170,426** | 1.10x |
+| 512 | 183,043 | **205,839** | 1.12x |
+| 4096 | 189,973 | **210,890** | 1.11x |
+
+Server CPU 99.3–99.7% throughout, all 9 points verified with `mismatches=0`.
+
+**Proof the client is not the limiter.** The UDP client is closer to its ceiling
+than the TCP one (it also pays two syscalls per datagram, like the epoll server
+does), so "server saturated" alone is not sufficient evidence — a saturated
+client caps throughput just as effectively. Adding client capacity is the test: if
+the client were limiting, more workers would raise throughput. At 512
+connections:
+
+| client workers | io_uring rps | epoll rps | uring client CPU | epoll client CPU | server CPU |
+|---:|---:|---:|---:|---:|---:|
+| 4 | **217,633** | **182,461** | 320% | 303% | 99.3–99.7% |
+| 4 (repeat) | 210,361 | 188,494 | 325% | 308% | 99.7% |
+| 6 | 179,517 | 167,477 | 281% | 255% | 99.3–99.7% |
+| 7 | 186,869 | 167,012 | 265% | 244% | 99.3–100.0% |
+
+Throughput goes **down** by 13–18% when workers are added, and client CPU goes
+down with it. That is the signature of a server-bound benchmark, not a
+client-bound one: extra runnable processes add scheduler and cache contention on
+a box whose server is pinned to one core, and nothing gained is left to gain. The
+control row (workers=4 re-run last, after the 6 and 7 runs) rules out monotonic
+drift — the 4-worker numbers reproduce within ~3%, which is the same sweep-to-sweep
+spread seen elsewhere, while the 6/7 shortfall is 13–18%.
+
+So the UDP numbers are server-limited, and the ceiling identified below is a real
+budget rather than an artefact of a capped load generator.
+
+**Syscalls** (`results/udp_strace.csv`, 64 connections, 1s window):
+
+| | epoll | io_uring |
+|---|---:|---:|
+| transactions in the window | 6,366 | 134,302 |
+| total syscalls | 12,805 | 2,717 |
+| **syscalls per transaction** | **2.012** | **0.0202** |
+| | | **~100x fewer** |
+
+That is a *bigger* syscall reduction than TCP's 78x — epoll still pays exactly
+two calls per datagram (`recvfrom` + `sendto`), and io_uring still pays none.
+And yet the throughput win is much smaller: **1.10x against TCP's 1.41x**.
+
+### The prediction was wrong, and the profile says why
+
+Before implementing this we predicted the UDP ratio would come out *higher* than
+TCP's, on the reasoning that io_uring's advantage is a roughly fixed per-operation
+tax: if UDP's socket-side work is lighter, dividing a constant by a smaller
+number gives a bigger factor. It does not. Per-transaction CPU, measured the same
+way as the TCP profile:
+
+| | epoll | io_uring | saving |
+|---|---:|---:|---:|
+| **TCP** | 8.75 µs | 6.49 µs | **2.26 µs** |
+| **UDP** | 5.52 µs | 4.84 µs | **0.68 µs** |
+
+The absolute saving collapses by 3.3x. The syscall/VFS bucket — the thing
+io_uring removes — is 2.56 µs of epoll's TCP time but only 0.89 µs of its UDP
+time. The tax is per-operation, but its *size* is set by how much VFS work the
+operation does, and `recvfrom`/`sendto` on a datagram socket is a much thinner
+path than `read`/`write` on a stream: the profile shows the UDP remainder in
+`do_syscall_64` (2.51%), `__internal_syscall_cancel` (1.36%), `fdget` (1.09%),
+`move_addr_to_user` (0.82%), `__check_object_size` (1.24%) — entry, fd lookup
+and address marshalling, with no stream state machine at all.
+
+io_uring's own cost drops too, 0.35 µs → 0.20 µs, so the denominator shrank as
+well; both effects push the same way.
+
+So the correct statement is the opposite of the one we set out to test:
+**io_uring's advantage scales with how heavy each operation is.** A synchronous
+64-byte stream round trip does enough per-operation work for syscall entry to be
+a large share of it. A datagram echo does less, and the same 100x syscall
+reduction buys a third of the throughput.
+
+One UDP-specific cost is visible and is charged to io_uring, not to the
+transport: `io_msg_copy_hdr` at 0.75% is io_uring copying the userspace
+`msghdr`/`iovec` on each `sendmsg`. Using a plain `send` is not possible here —
+the reply needs a destination address.
+
+## Where the time actually goes (tcp)
 
 The syscall counts above show *that* io_uring wins. A CPU profile shows *where
 the remaining time is*, and it changes what is worth trying next.
@@ -255,7 +350,7 @@ the event engine.
 
 ## Honest reading
 
-- The **1.38x–1.54x throughput** margin is specific to 64-byte synchronous
+- The **1.38x–1.42x throughput** margin is specific to 64-byte synchronous
   ping-pong over loopback with single-threaded servers. It does not transfer to
   streaming, large payloads, or real NICs.
 - The **~79x syscall-per-transaction** reduction is the structural result. It is
@@ -265,6 +360,11 @@ the event engine.
 - The profile shows **76% of the remaining per-transaction cost is TCP/IP/
   netfilter work that neither implementation controls.** The result is close to
   the practical ceiling for this shape, not an early point on a curve.
+- **The margin is a property of the operation, not just of io_uring.** The same
+  design on UDP cuts syscalls per transaction by ~100x — *more* than TCP's 78x —
+  and buys only 1.10x instead of 1.41x, because `recvfrom`/`sendto` does far less
+  kernel work per operation than `read`/`write` does. The bigger the operation,
+  the more of it syscall entry represents, and the more there is to win.
 - io_uring **loses** on this benchmark if implemented naively with one-at-a-time
   SQEs. The results above require multishot accept/recv, the provided buffer
   ring, correct buffer ownership, and correct CQE batching. See the README for

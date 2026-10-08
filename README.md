@@ -15,17 +15,22 @@ rings, and batching**.
 
 ```bash
 make                 # build all three binaries into build/
-make bench           # timing matrix + syscall pass, then the table (~24s total)
-make report          # re-print the table from existing CSVs (instant, no re-run)
-make strace          # re-run only the syscall-counting pass, then report
+make bench           # tcp + udp timing matrix + syscall passes, then the tables
+make bench-udp       # udp only
+make report          # re-print the tables from existing CSVs (instant, no re-run)
+make strace          # re-run only the syscall-counting passes, then report
 ```
 
-Everything is tuned to finish **well under 30 seconds end to end**. `make bench`
+Everything is tuned to finish **well under a minute end to end**. `make bench`
 is the only target that measures anything, and it does both passes: the timing
 matrix at 3s per point, then a 1s strace pass, so syscall counts are always in
 its output. The strace window is shorter because that pass *counts* syscalls
 rather than measuring throughput — epoll still issues ~13k calls in 1s, and the
 syscalls-per-transaction ratio is scale-invariant.
+
+**tcp and udp are separate experiments**, each with its own CSV
+(`results/bench.csv`, `results/udp.csv`) and its own table. Their rates are not
+comparable — a datagram is not a stream — so `report.py` never merges them.
 
 `make report` is the read-only view: it just re-renders
 `results/bench.csv` + `results/bench_strace.csv`, so you can look at the
@@ -55,6 +60,7 @@ Other overrides (all env vars):
 ```bash
 CONNS_LIST="256" ./bench.sh            # single point
 IMPLS=uring ./bench.sh                  # one implementation
+PROTO_LIST=udp ./bench.sh               # one transport (tcp | udp)
 WORKERS=8 ./bench.sh                    # more client worker processes
 SKIP_STRACE=1 ./bench.sh                # timing only
 make bench-quick CONNS=1024 IMPLS=uring # single point, both impls, ~8s
@@ -143,7 +149,9 @@ params.flags = IORING_SETUP_SINGLE_ISSUER
 - a **provided buffer ring** (`io_uring_setup_buf_ring`, 2048 × 64 B), so reads
   need no per-connection buffer allocation. Buffer size equals the payload size
   and both are pinned together; see
-  [Buffer size is not a lever](RESULTS.md#buffer-size-is-not-a-lever)
+  [Buffer size is not a lever](RESULTS.md#buffer-size-is-not-a-lever). In UDP
+  mode the buffer is `PAYLOAD_SIZE + 32` bytes because of the recvmsg aux
+  layout, so the coupling there is slightly different but just as strict.
 - batched CQE draining — one `io_uring_enter` per wakeup, then walk every CQE
 
 #### Buffer ownership
@@ -174,6 +182,33 @@ The generation exists because **fd numbers get recycled**. If connection A on
 fd 7 closes and connection B is then accepted as fd 7, a late completion still
 tagged with the old generation must not be attributed to B. Every completion
 is validated against a per-fd generation counter before acting on it.
+
+#### UDP mode (`proto=udp`)
+
+Datagrams carry no connection, so the UDP path is **stateless on both sides**:
+one socket, one permanently-armed multishot `RECVMSG`, and every echo goes back
+to whatever `sockaddr` the kernel hands us. There is no accept, no `connect`, no
+`close`, no per-client generation counter, and no EOF to detect — which is the
+point: with zero per-connection machinery on either side, the comparison
+isolates exactly "2 syscalls vs 0 syscalls per datagram" with nothing else
+differing. `TCP_NODELAY` is not set either; UDP has no stream to coalesce.
+
+Two things are worth knowing about the io_uring side:
+
+- **Multishot `RECVMSG` cannot return a bare payload.** The kernel prepends the
+  aux layout (`struct io_uring_recvmsg_out`, then the source `sockaddr`) *inside*
+  the provided buffer, so a UDP buffer is 32 bytes larger than the payload and
+  the echo length must come from the aux `payloadlen` field — **`cqe->res` is
+  aux+payload together**, not the payload length. A `NULL` msghdr is rejected
+  with `-EFAULT`; it is required, because the kernel needs it to lay out the aux.
+- **The buffer-ownership rule does not go away.** Each in-flight buffer owns the
+  `msghdr`/`iovec` its echo is sent from (indexed by `buf_id`), so the same
+  window applies to both, and the client's content check covers this mode too.
+
+A datagram larger than the buffer is truncated silently by `recv`, so `MSG_TRUNC`
+and an unexpected `payloadlen` are counted as errors and dropped rather than
+echoed as garbage — the same hazard as the `BUF_SIZE`/`MSG_SIZE` coupling
+below, guarded the same way.
 
 ---
 
@@ -256,7 +291,10 @@ generator pollutes both measurements. The sibling map is read at runtime from
   the parent uses the longest, and it warns if fewer connections were
   established than requested.
 
-Worker count was tuned empirically. More is *worse*:
+Worker count was tuned empirically (and re-checked for udp, where the client pays
+two syscalls per datagram and so sits closer to its ceiling — adding workers still
+*lowers* throughput, by 13–18%, which is what a server-bound run looks like). More
+is *worse*:
 
 | workers | server CPU | throughput |
 |---|---|---|
@@ -338,13 +376,21 @@ Headline, on this box:
 
 | | epoll | io_uring |
 |---|---:|---:|
-| throughput @512 conns | 114,933 rps | **161,647 rps** (1.41x) |
-| syscalls per transaction | 2.043 | **0.0260** (~79x fewer) |
+| throughput @512 conns, tcp | 110,505 rps | **152,904 rps** (1.38x) |
+| throughput @512 conns, udp | 183,043 rps | **205,839 rps** (1.12x) |
+| syscalls per transaction, tcp | 2.043 | **0.0260** (~79x fewer) |
+| syscalls per transaction, udp | 2.012 | **0.0202** (~100x fewer) |
 | `read`/`write` in hot path | one each per txn | **0** |
 | echoes failing content check | 0 | **0** |
 
-Server CPU was 99.3–100.7% in every run, and the client had headroom at 64 and
+Server CPU was 99.0–101.0% in every run, and the client had headroom at 64 and
 512 connections, so the server was the bottleneck throughout.
+
+**The margin is a property of the operation, not just of io_uring.** UDP cuts
+syscalls per transaction by *more* (100x vs 79x) and yet wins by *less* (1.12x vs
+1.38x), because syscall entry is a larger share of a stream read/write than of a
+datagram `recvfrom`/`sendto`. The heavier the operation, the more there is to
+win.
 
 ### Where the remaining time goes
 
@@ -375,6 +421,10 @@ in [Where the time actually goes](RESULTS.md#where-the-time-actually-goes).
   76% of io_uring's per-transaction time in a socket-path floor it shares with
   `epoll`, and only 0.35 µs of its own machinery, there is no further
   order-of-magnitude win available on the ring side for this workload.
+- **The UDP mode is not a production-shaped UDP server.** No rate limiting, no
+  amplification protection, no idle reaping, and it ignores `MSG_TRUNC`-adjacent
+  edge cases beyond counting and dropping them. It exists to isolate the syscall
+  tax, nothing more.
 - Loopback means the kernel's networking path is exercised but no NIC, no
   DMA, and no real NIC interrupt cost. On this VM, netfilter conntrack, NAT,
   iptables and SELinux account for **13.6%** of server CPU — real cost, but an
