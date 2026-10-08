@@ -63,6 +63,12 @@ DURATION=${DURATION:-3}
 NODELAY=${NODELAY:-1}
 RUNS=${RUNS:-1}
 IMPLS=${IMPLS:-"epoll uring"}
+# A point only measures the server if the server was saturated. A run that
+# under-saturates is a failed measurement, not a slow one -- it means something
+# else on the box was competing for cpu0 -- so it gets retried rather than
+# recorded. Observed in practice: one sweep produced 43%/45%/93% server CPU at
+# uring/64 while the same cell re-run under both builds gave 99.3% every time.
+MIN_SRV_CPU=${MIN_SRV_CPU:-95}
 # Transports to sweep. "both" by default: the UDP mode is an additive experiment
 # in its own result files, so running both never mixes them.
 PROTO_LIST=${PROTO_LIST-"tcp udp"}
@@ -369,9 +375,17 @@ run_strace_pass() {
 # Sweep every transport. Each writes its own result files, so a udp point can
 # never be averaged into the tcp table -- the two are different workloads and
 # their rps are not comparable.
+#
+# A full sweep is deliberately quiet while a run is in flight (the client holds
+# the CPU for DURATION seconds with nothing to print), and RUNS=3 across both
+# transports is a few minutes. So print before each run and stamp every line with
+# elapsed time: a sweep that is progressing and one that is wedged should never
+# look the same.
+SWEEP_START=$(date +%s)
+elapsed() { echo "t+$(( $(date +%s) - SWEEP_START ))s"; }
 for PROTO in $PROTO_LIST; do
     CSV=$(csv_for "$PROTO")
-    echo "=== proto: $PROTO ==="
+    echo "=== proto: $PROTO ($(elapsed)) ==="
 
     if [ "$RUN_TIMING" = "1" ]; then
         # Each invocation of the full matrix is a self-contained experiment, so
@@ -394,11 +408,14 @@ for PROTO in $PROTO_LIST; do
     # deliberate: a server returning wrong data makes every other number from
     # the run suspect, so continuing would only produce more implausible data.
     INVALID=0
+    UNDER_SATURATED=0
     for impl in $IMPLS; do
         warmed=0
         for conns in $CONNS_LIST; do
             port=$(port_for "$impl" "$conns")
             if [ "$warmed" -eq 0 ]; then
+                printf "  %-5s %-3s conns=%-5s warmup %ss ... (%s)\n" \
+                    "$impl" "$PROTO" "$conns" "$WARMUP" "$(elapsed)" >&2
                 run_once "$impl" "$conns" "$port" "$WARMUP" >/dev/null # discarded
                 warmed=1
             fi
@@ -408,6 +425,9 @@ for PROTO in $PROTO_LIST; do
             # the accept queue). Retry rather than record a bogus zero.
             attempt=0
             while :; do
+                # whichever attempt succeeds is recorded as run 1
+                printf "  %-5s %-3s conns=%-5s run=1 measuring %ss (attempt %s) ... (%s)\n" \
+                    "$impl" "$PROTO" "$conns" "$DURATION" "$((attempt + 1))" "$(elapsed)" >&2
                 run_once "$impl" "$conns" "$port" "$DURATION"
                 completed="$RUN_COMPLETED"
                 elapsed="$RUN_ELAPSED"
@@ -427,6 +447,23 @@ for PROTO in $PROTO_LIST; do
                     break
                 fi
 
+                # Undersaturated server: cannot claim the server was the
+                # bottleneck, so the point is not usable.
+                if [ -n "$cpu_pct" ] && [ "$cpu_pct" != "NA" ] && \
+                   awk -v c="$cpu_pct" -v m="$MIN_SRV_CPU" 'BEGIN{exit !(c+0 < m+0)}'; then
+                    echo "  .. $impl $PROTO conns=$conns: server only ${cpu_pct}% CPU" \
+                         "(need >=${MIN_SRV_CPU}%), retry" >&2
+                    attempt=$((attempt + 1))
+                    if [ "$attempt" -ge 3 ]; then
+                        echo "  !! $impl $PROTO conns=$conns: server never saturated;" \
+                             "point NOT recorded" >&2
+                        UNDER_SATURATED=1
+                        break
+                    fi
+                    sleep 2
+                    continue
+                fi
+
                 if [ "${completed:-0}" -gt 0 ]; then
                     break
                 fi
@@ -439,17 +476,19 @@ for PROTO in $PROTO_LIST; do
                 sleep 2
             done
 
-            if [ "$INVALID" = "1" ]; then
+            if [ "$INVALID" = "1" ] || [ "$UNDER_SATURATED" = "1" ]; then
                 break
             fi
 
             for run in $(seq 1 "$RUNS"); do
                 rps=$(awk -v c="$completed" -v t="$elapsed" 'BEGIN{if(t>0)printf "%.1f",c/t;else print 0}')
                 echo "$impl,$conns,$run,$completed,$elapsed,$rps,$cpu_pct,$client_cpu,$WORKERS" >> "$CSV"
-                printf "  %-5s %-3s conns=%-5s run=%s completed=%-9s rps=%-9s srv_cpu=%s%% cli_cpu=%s%%\n" \
-                    "$impl" "$PROTO" "$conns" "$run" "$completed" "$rps" "$cpu_pct" "$client_cpu"
+                printf "  %-5s %-3s conns=%-5s run=%s completed=%-9s rps=%-9s srv_cpu=%s%% cli_cpu=%s%%  (%s)\n" \
+                    "$impl" "$PROTO" "$conns" "$run" "$completed" "$rps" "$cpu_pct" "$client_cpu" "$(elapsed)"
                 # more than one sample per point: re-measure each time
                 if [ "$run" -lt "$RUNS" ]; then
+                    printf "  %-5s %-3s conns=%-5s run=%s measuring %ss ... (%s)\n" \
+                        "$impl" "$PROTO" "$conns" "$((run + 1))" "$DURATION" "$(elapsed)" >&2
                     run_once "$impl" "$conns" "$port" "$DURATION"
                     completed="$RUN_COMPLETED"
                     elapsed="$RUN_ELAPSED"
@@ -463,17 +502,29 @@ for PROTO in $PROTO_LIST; do
                         INVALID=1
                         break
                     fi
+                    if [ -n "$cpu_pct" ] && [ "$cpu_pct" != "NA" ] && \
+                       awk -v c="$cpu_pct" -v m="$MIN_SRV_CPU" 'BEGIN{exit !(c+0 < m+0)}'; then
+                        echo "  !! $impl $PROTO conns=$conns: repeat run under-saturated" \
+                             "(${cpu_pct}% < ${MIN_SRV_CPU}%); point NOT recorded" >&2
+                        UNDER_SATURATED=1
+                        break
+                    fi
                 fi
             done
 
-            if [ "$INVALID" = "1" ]; then
+            if [ "$INVALID" = "1" ] || [ "$UNDER_SATURATED" = "1" ]; then
                 break
             fi
         done
-        [ "$INVALID" = "1" ] && break
+        [ "$INVALID" = "1" ] || [ "$UNDER_SATURATED" = "1" ] && break
     done
 
     fi # RUN_TIMING
+
+    if [ "${UNDER_SATURATED:-0}" = "1" ]; then
+        echo "  !! at least one point never saturated the server and was not recorded;" \
+             "the strace pass is skipped rather than paired with incomplete timing data" >&2
+    fi
 
     # A run that served wrong data is not evidence about throughput, so the
     # strace pass is skipped too rather than quietly adding counts to the CSVs.

@@ -1,23 +1,33 @@
-CFLAGS = -std=gnu23 -Wall -Wextra -Werror -Wno-gnu-folding-constant -g
+# Frame pointers are unconditional: -fno-omit-frame-pointer establishes the %rbp
+# chain that `perf record -g fp` needs (gcc omits frame pointers at -O3 by
+# default, leaving 1-2 setups across ~40 symbols), and
+# -fno-optimize-sibling-calls stops tail calls reusing the caller's frame and
+# severing that chain mid-stack. gcc leaves sibling calls enabled even with frame
+# pointers, so asking for only the first flag yields stacks that are silently
+# truncated at tail-call sites. Neither flag is substitutable for the other.
+#
+# They cost nothing measurable here (-0.8% to +2.6% across the four
+# impl/transport combinations, all inside run-to-run noise), because at -O3
+# these servers inline down to ~11 symbols and userspace is ~0.3% of samples.
+CFLAGS = -std=gnu23 -Wall -Wextra -Werror -Wno-gnu-folding-constant -g \
+         -fno-omit-frame-pointer -fno-optimize-sibling-calls
 LDFLAGS_URING = -luring
 
-.PHONY: all build bench bench-quick bench-udp report strace clean distclean fmt
+.PHONY: all build prof bench bench-quick bench-udp report strace clean distclean fmt
 
 all: build
 
 build: build/epoll_srv build/uring_srv build/pingpong_cli
 
 build/epoll_srv: epoll_srv.c
-	mkdir -p build
-	gcc $(CFLAGS) -O3 $< -o $@
-
 build/uring_srv: uring_srv.c
-	mkdir -p build
-	gcc $(CFLAGS) -O3 $< $(LDFLAGS_URING) -o $@
-
 build/pingpong_cli: pingpong_cli.c
+
+build/%: %.c
 	mkdir -p build
-	gcc $(CFLAGS) -O3 $< -o $@
+	gcc $(CFLAGS) -O3 $< $(LIBS) -o $@
+
+build/uring_srv: LIBS = $(LDFLAGS_URING)
 
 # Timing matrix for both transports + short syscall-counting passes, then the
 # tables. Sweeps tcp and udp by default (PROTO_LIST); they write separate CSVs
@@ -53,6 +63,14 @@ bench-quick: build
 	CONNS_LIST=$(CONNS) IMPLS=$(IMPLS) RUNS=1 WARMUP=1 DURATION=3 SKIP_STRACE=1 \
 		RESULTS_CSV="$$tmp" PROTO_LIST=$(PROTO) ./bench.sh; \
 	./report.py "$$tmp" "" "quick run"
+
+# CPU profile of a server, with the gates in profile.sh that make the result
+# mean something (privileges, kernel samples actually landing, stacks actually
+# unwinding). Override with `make prof IMPL=epoll MODE=stat`.
+IMPL ?= uring
+MODE ?= fp
+prof: build
+	./profile.sh $(IMPL) $(MODE)
 
 report:
 	./report.py

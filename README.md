@@ -19,9 +19,14 @@ make bench           # tcp + udp timing matrix + syscall passes, then the tables
 make bench-udp       # udp only
 make report          # re-print the tables from existing CSVs (instant, no re-run)
 make strace          # re-run only the syscall-counting passes, then report
+make prof            # CPU profile of the uring server, with gates
 ```
 
-Everything is tuned to finish **well under a minute end to end**. `make bench`
+The default `make bench` (1 run per point) finishes in about 45 seconds.
+`RUNS=3` medians take roughly **two minutes**, because the sweep is then 12
+points x 3 runs plus warmups and two strace passes. Each run prints before it
+starts and stamps every line with elapsed time, so a progressing sweep is never
+mistaken for a wedged one. `make bench`
 is the only target that measures anything, and it does both passes: the timing
 matrix at 3s per point, then a 1s strace pass, so syscall counts are always in
 its output. The strace window is shorter because that pass *counts* syscalls
@@ -376,33 +381,66 @@ Headline, on this box:
 
 | | epoll | io_uring |
 |---|---:|---:|
-| throughput @512 conns, tcp | 110,505 rps | **152,904 rps** (1.38x) |
-| throughput @512 conns, udp | 183,043 rps | **205,839 rps** (1.12x) |
-| syscalls per transaction, tcp | 2.043 | **0.0260** (~79x fewer) |
-| syscalls per transaction, udp | 2.012 | **0.0202** (~100x fewer) |
+| throughput @512 conns, tcp | 115,083 rps | **161,759 rps** (1.41x) |
+| throughput @512 conns, udp | 191,564 rps | **219,317 rps** (1.14x) |
+| syscalls per transaction, tcp | 2.044 | **0.0260** (~79x fewer) |
+| syscalls per transaction, udp | 2.016 | **0.0202** (~100x fewer) |
 | `read`/`write` in hot path | one each per txn | **0** |
 | echoes failing content check | 0 | **0** |
 
-Server CPU was 99.0–101.0% in every run, and the client had headroom at 64 and
+Server CPU was 99.0–100.7% in every run, and the client had headroom at 64 and
 512 connections, so the server was the bottleneck throughout.
 
+A point whose server did not saturate is **not recorded**: `bench.sh` retries it
+and drops it if it still fails, because an unsaturated run is a failed
+measurement rather than a slow one. See
+[A point is only a measurement if the server saturated](RESULTS.md#a-point-is-only-a-measurement-if-the-server-saturated).
+
 **The margin is a property of the operation, not just of io_uring.** UDP cuts
-syscalls per transaction by *more* (100x vs 79x) and yet wins by *less* (1.12x vs
-1.38x), because syscall entry is a larger share of a stream read/write than of a
-datagram `recvfrom`/`sendto`. The heavier the operation, the more there is to
-win.
+syscalls per transaction by *more* (~100x vs ~79x) and yet wins by *less*
+(1.14x vs 1.41x), because syscall entry is a larger share of a stream
+read/write than of a datagram `recvfrom`/`sendto`. The heavier the operation, the
+more there is to win.
 
-### Where the remaining time goes
+### Where the remaining time goes (and how it was measured)
 
-A CPU profile of both servers (`perf record -e cpu-clock`; this box is WSL2 and
-exposes no PMU, so `cycles` is unavailable) puts io_uring at **6.49 µs per
-transaction**, of which:
+CPU attribution comes from [`profile.sh`](profile.sh), not from ad-hoc `perf`
+invocations:
+
+```bash
+make prof                    # uring, frame-pointer unwinding
+make prof IMPL=epoll MODE=stat   # counters instead of a profile
+make prof PROTO=udp          # profile the datagram path
+```
+
+`MODE` is `fp` (default), `flat` or `stat`.
+
+**Frame pointers are compiled in for everything**, not just profiling:
+`CFLAGS` carries `-fno-omit-frame-pointer -fno-optimize-sibling-calls`
+unconditionally. Both are required and neither substitutes — the first
+establishes the `%rbp` chain, the second stops tail calls severing it. They
+measured free (−0.8% to +2.6% across the four impl/transport combinations, all
+inside run-to-run noise) because at `-O3` these servers inline down to ~11
+symbols and userspace is ~0.3% of samples.
+
+`profile.sh` exists because this measurement failed silently three times: `perf
+-g none` is parsed as a workload name and records nothing; recording before
+starting the client profiles an idle server; and with `perf_event_paranoid=2`
+unprivileged perf silently appends `:u` to every event and returns a
+"successful" profile containing **no kernel samples at all**. So the script
+refuses on the privilege gates, then verifies the artefact — kernel frames
+actually present, mean stack depth ≥ 5 — and exits non-zero rather than reporting
+a plausible-looking number.
+
+On this box the profile then says:
 
 - **4.92 µs (76%) is TCP + IP + netfilter work that both implementations pay
   identically** and no `io_uring` feature can touch
 - **0.35 µs is `io_uring` core** — versus the ~2.3 µs of syscall and VFS entry
   path (`do_syscall_64`, `vfs_read`, `sock_read_iter`, …) it replaces
-- **the userspace event loop measures 0.00%**, below the sampling floor
+- **the userspace event loop is 0.3% of samples**, against 3.5% for epoll
+- **0.00028 context switches per transaction** for both servers, so neither is
+  sleeping per request
 
 The same profile **rules out three optimisations** before they are attempted:
 `IORING_RECVSEND_POLL_FIRST` (`io_arm_poll_handler` at 0.00% of stacks — recv
