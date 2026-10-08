@@ -10,6 +10,12 @@
  * of exactly that request comes back, then send the next. That keeps at most
  * one request in flight per connection, so server-side accounting is
  * unambiguous.
+ *
+ * Every request carries a per-connection, per-request tag in its first bytes
+ * and the echo is compared against it. This is not a nicety: a server that
+ * recycles a buffer early still returns a full-length echo, just the wrong
+ * bytes, so a length check alone cannot detect it. Verifying content is the
+ * only way that class of bug fails loudly instead of silently skewing rps.
  */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
@@ -29,10 +35,20 @@
 #include <time.h>
 #include <unistd.h>
 
+/* Bytes of every request that carry the identifying tag. One cache line, so
+ * verification stays off the hot path; 16 is the natural choice on x86-64. */
+#define TAG_BYTES 16
+
 struct conn {
     int fd;
     int awaiting; /* request sent, echo outstanding */
     long long sent;
+    /* Tag of the request currently in flight, i.e. what the echo must match.
+     * Valid only while awaiting is set. */
+    unsigned char tag[TAG_BYTES];
+    /* Global index across the whole run, so two connections never share a tag
+     * even when they live in the same worker. */
+    uint64_t index;
 };
 
 struct worker_cfg {
@@ -49,6 +65,10 @@ struct worker_cfg {
 /* Handed back to the parent over the pipe. */
 struct worker_result {
     long long completed;
+    /* Echoes whose content did not match the request that produced them. Any
+     * non-zero value means the server returned the wrong bytes and the run's
+     * throughput numbers are not trustworthy. */
+    long long mismatches;
     long long elapsed_ns;
     long long cpu_ticks; /* self utime+stime, in clock ticks */
     int connected;
@@ -63,9 +83,13 @@ usage(const char *prog) {
         "          [duration_sec] [nodelay=1] [workers=auto] [cpu_base=1]\n"
         "\n"
         "Prints a single line:\n"
-        "  '<total_completed> <measurement_seconds> <client_cpu_percent_of_one_core>'\n"
+        "  '<total_completed> <measurement_seconds> <client_cpu_percent_of_one_core>"
+        " <echo_mismatches>'\n"
         "The measurement window starts only after every connection is\n"
         "established, so connection setup is excluded from the reported rate.\n"
+        "Every request carries a per-connection tag that the echo is checked\n"
+        "against. Exit status is non-zero if any echo failed that check, so a\n"
+        "run that served wrong data can never be read as a valid result.\n"
         "msgs_per_conn < 0 means run until the duration expires.\n"
         "workers are pinned to cpus cpu_base, cpu_base+1, ...\n",
         prog
@@ -121,6 +145,20 @@ pin_to_cpu(int cpu) {
     return sched_setaffinity(0, sizeof(set), &set);
 }
 
+/* Tag written into every request: a per-run nonce, the connection's global
+ * index, and the request's sequence number. Two properties matter. The nonce
+ * keeps an all-zero or all-'A' buffer from passing the comparison by accident,
+ * and the sequence number makes a stale echo -- one replayed from an earlier
+ * request -- detectable instead of indistinguishable from the right one. These
+ * are little-endian byte copies rather than a packed struct, so the on-wire
+ * layout cannot depend on the compiler's padding choices. */
+static void
+make_tag(unsigned char *tag, uint64_t nonce, uint64_t conn_index, uint64_t seq) {
+    memcpy(tag, &nonce, sizeof(nonce));
+    memcpy(tag + sizeof(nonce), &conn_index, sizeof(conn_index));
+    memcpy(tag + sizeof(nonce) + sizeof(conn_index), &seq, sizeof(seq));
+}
+
 /* Non-blocking connect that waits for writability, so N connections can be
  * established quickly without serialising on the handshake. */
 static int
@@ -161,8 +199,8 @@ connect_nb(const struct sockaddr_in *addr, int nodelay) {
 static void
 run_worker(const struct worker_cfg *cfg, struct worker_result *out) {
     struct conn *conns = calloc((size_t)cfg->count, sizeof(*conns));
-    char *req = malloc((size_t)cfg->msg_size);
-    char *echo = malloc((size_t)cfg->msg_size);
+    unsigned char *req = malloc((size_t)cfg->msg_size);
+    unsigned char *echo = malloc((size_t)cfg->msg_size);
     struct pollfd *pfds = calloc((size_t)cfg->count, sizeof(*pfds));
     if (!conns || !req || !echo || !pfds) {
         return;
@@ -170,6 +208,23 @@ run_worker(const struct worker_cfg *cfg, struct worker_result *out) {
     memset(req, 'A', (size_t)cfg->msg_size);
     memset(echo, 0, (size_t)cfg->msg_size);
 
+    /* The tag has to fit in a message; a smaller-than-16B payload still gets
+     * whatever prefix fits, so verification still works at small sizes. */
+    if (cfg->msg_size < TAG_BYTES) {
+        fprintf(stderr, "msg_size=%d is smaller than the %d-byte tag\n", cfg->msg_size, TAG_BYTES);
+        return;
+    }
+
+    /* Per-run nonce, so a zeroed or stale buffer cannot pass by accident, and
+     * so a buffer left over from a previous run is never accepted. */
+    uint64_t nonce = 0x9e3779b97f4a7c15ULL;
+    nonce ^= (uint64_t)getpid();
+    struct timespec nts;
+    clock_gettime(CLOCK_REALTIME, &nts);
+    nonce ^= (uint64_t)nts.tv_nsec * 0xff51afd7ed558ccdULL;
+    nonce ^= (uint64_t)nts.tv_sec << 17;
+
+    long long mismatches = 0;
     int live = 0;
     for (int i = 0; i < cfg->count; i++) {
         int fd = connect_nb(&cfg->addr, cfg->nodelay);
@@ -179,6 +234,7 @@ run_worker(const struct worker_cfg *cfg, struct worker_result *out) {
         conns[live].fd = fd;
         conns[live].awaiting = 0;
         conns[live].sent = 0;
+        conns[live].index = (uint64_t)(cfg->first + live);
         live++;
     }
 
@@ -234,6 +290,13 @@ run_worker(const struct worker_cfg *cfg, struct worker_result *out) {
             if (conns[i].awaiting && (re & (POLLIN | POLLHUP | POLLERR))) {
                 ssize_t nread = recv(conns[i].fd, echo, (size_t)cfg->msg_size, 0);
                 if (nread == cfg->msg_size) {
+                    /* A full-length echo still proves nothing about *which*
+                     * request it was, so compare the tag. This is the check
+                     * that catches a server recycling a provided buffer before
+                     * its send has read from it. */
+                    if (memcmp(echo, conns[i].tag, TAG_BYTES) != 0) {
+                        mismatches++;
+                    }
                     completed++;
                     if (!infinite && conns[i].sent >= per_conn_limit) {
                         /* this connection has served its budget */
@@ -249,6 +312,14 @@ run_worker(const struct worker_cfg *cfg, struct worker_result *out) {
                 if (!infinite && conns[i].sent >= per_conn_limit) {
                     dead = 1;
                 } else {
+                    /* req is shared by every connection in this worker, so it
+                     * is stamped immediately before the send. Safe because a
+                     * worker is single-threaded and the kernel has already
+                     * copied the bytes by the time send() returns. */
+                    uint64_t next_seq = (uint64_t)conns[i].sent + 1;
+                    make_tag(req, nonce, conns[i].index, next_seq);
+                    memcpy(conns[i].tag, req, TAG_BYTES);
+
                     ssize_t nw = send(conns[i].fd, req, (size_t)cfg->msg_size, 0);
                     if (nw == cfg->msg_size) {
                         conns[i].awaiting = 1;
@@ -279,6 +350,7 @@ run_worker(const struct worker_cfg *cfg, struct worker_result *out) {
     struct timespec done;
     clock_gettime(CLOCK_MONOTONIC, &done);
     out->completed = completed;
+    out->mismatches = mismatches;
     out->elapsed_ns =
         (long long)((done.tv_sec - ready.tv_sec) * 1000000000LL + (done.tv_nsec - ready.tv_nsec));
     out->cpu_ticks = self_cpu_ticks() - ready_ticks;
@@ -412,6 +484,7 @@ main(int argc, char **argv) {
     close(pfd[1]);
 
     long long total = 0;
+    long long mismatches = 0;
     long long max_elapsed_ns = 0;
     long long cpu_ticks = 0;
     int connected = 0;
@@ -421,6 +494,7 @@ main(int argc, char **argv) {
         ssize_t got = read(pfd[0], &r, sizeof(r));
         if (got == (ssize_t)sizeof(r)) {
             total += r.completed;
+            mismatches += r.mismatches;
             connected += r.connected;
             requested += r.requested;
             cpu_ticks += r.cpu_ticks;
@@ -432,6 +506,19 @@ main(int argc, char **argv) {
     close(pfd[0]);
     for (int w = 0; w < workers; w++) {
         waitpid(pids[w], NULL, 0);
+    }
+
+    if (mismatches > 0) {
+        /* Reported loudly and on the way to a non-zero exit: a mismatched echo
+         * means the server returned bytes from the wrong buffer, so the rate it
+         * just reported is meaningless and must not be recorded as a result. */
+        fprintf(
+            stderr,
+            "ERROR: %lld of %lld echoes did not match the request that produced "
+            "them; the server returned wrong data and this run is invalid\n",
+            mismatches,
+            total
+        );
     }
 
     if (connected < requested) {
@@ -460,9 +547,9 @@ main(int argc, char **argv) {
         client_cpu_pct = (double)cpu_ticks / (hz * elapsed) * 100.0;
     }
 
-    printf("%lld %.6f %.1f\n", total, elapsed, client_cpu_pct);
+    printf("%lld %.6f %.1f %lld\n", total, elapsed, client_cpu_pct, mismatches);
     free(cfgs);
     free(pids);
     free(cpu_list);
-    return 0;
+    return mismatches > 0 ? 1 : 0;
 }

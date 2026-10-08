@@ -212,10 +212,17 @@ run_once() {
     cpu_before=$(awk '{print $14+$15}' "/proc/$srv_pid/stat" 2>/dev/null) || cpu_before=0
     [ -z "$cpu_before" ] && cpu_before=0
 
-    local res
-    res=$(timeout $((dur + 30)) taskset -c "$CLIENT_CPU_LIST" \
+    # The client's stderr is dropped so its single result line stays clean, so
+    # capture its exit status separately: it is non-zero exactly when some echo
+    # failed content verification. `local` masks the status of the assignment,
+    # and the pipe to tail would mask it again, so the exit code is checked
+    # inside the subshell where it is still visible.
+    local res rc
+    res=$( { timeout $((dur + 30)) taskset -c "$CLIENT_CPU_LIST" \
         ./build/pingpong_cli "$TARGET_HOST" "$port" "$conns" -1 "$MSG_SIZE" \
-        "$dur" "$NODELAY" "$WORKERS" "$CLIENT_CPU_BASE" 2>/dev/null | tail -1)
+        "$dur" "$NODELAY" "$WORKERS" "$CLIENT_CPU_BASE" 2>/dev/null | tail -1; \
+        exit "${PIPESTATUS[0]}"; } )
+    rc=$?
 
     local cpu_after
     cpu_after=$(awk '{print $14+$15}' "/proc/$srv_pid/stat" 2>/dev/null) || cpu_after=0
@@ -258,6 +265,16 @@ run_once() {
     RUN_CLIENT_CPU=$(echo "$res" | awk '{print $3}')
     [ -z "$RUN_CLIENT_CPU" ] && RUN_CLIENT_CPU=0
     RUN_SYSCALLS="${syscalls:-NA}"
+    # Echoes whose content did not match the request that produced them. Any
+    # non-zero value means the server returned wrong bytes, so the rate from
+    # this run is meaningless and must not be recorded as a result.
+    RUN_MISMATCHES=$(echo "$res" | awk '{print $4}')
+    [ -z "$RUN_MISMATCHES" ] && RUN_MISMATCHES=0
+    # Belt and braces: the client already counts mismatches on stdout, but its
+    # exit status is the authoritative signal and survives a truncated line.
+    if [ "$rc" -ne 0 ]; then
+        RUN_MISMATCHES=1
+    fi
 }
 
 # Short syscall-counting pass. Kept out of the timing pass because strace makes
@@ -297,6 +314,10 @@ run_strace_pass() {
 # re-warms global state -- caches, slabs, TCP structures -- and measuring in
 # ascending order leaves the heaviest point measured last, fully warm.
 if [ "$RUN_TIMING" = "1" ]; then
+# Set when a point failed content verification. Stopping the whole sweep is
+# deliberate: a server returning wrong data makes every other number from the
+# run suspect, so continuing would only produce more implausible-looking data.
+INVALID=0
 for impl in $IMPLS; do
     warmed=0
     for conns in $CONNS_LIST; do
@@ -312,12 +333,23 @@ for impl in $IMPLS; do
         attempt=0
         while :; do
             run_once "$impl" "$conns" "$port" "$DURATION"
-            completed="$RUN_COMPLETED"
+completed="$RUN_COMPLETED"
             elapsed="$RUN_ELAPSED"
             cpu_pct="$RUN_CPU_PCT"
             client_cpu="$RUN_CLIENT_CPU"
+            mismatches="$RUN_MISMATCHES"
             [ -z "$completed" ] && completed=0
             [ -z "$elapsed" ] && elapsed=0
+
+            # Wrong echo content is not retried: unlike a zero-transaction
+            # point, which is usually a port still releasing, corruption is a
+            # property of the server under test. Retrying would just hide it.
+            if [ "${mismatches:-0}" -ne 0 ]; then
+                echo "  !! $impl conns=$conns: $mismatches echoes had wrong content;" \
+                     "run is INVALID and will not be recorded" >&2
+                INVALID=1
+                break
+            fi
 
             if [ "${completed:-0}" -gt 0 ]; then
                 break
@@ -331,6 +363,10 @@ for impl in $IMPLS; do
             sleep 2
         done
 
+        if [ "$INVALID" = "1" ]; then
+            break
+        fi
+
         for run in $(seq 1 "$RUNS"); do
             rps=$(awk -v c="$completed" -v t="$elapsed" 'BEGIN{if(t>0)printf "%.1f",c/t;else print 0}')
             echo "$impl,$conns,$run,$completed,$elapsed,$rps,$cpu_pct,$client_cpu,$WORKERS" >> "$CSV"
@@ -343,12 +379,33 @@ for impl in $IMPLS; do
                 elapsed="$RUN_ELAPSED"
                 cpu_pct="$RUN_CPU_PCT"
                 client_cpu="$RUN_CLIENT_CPU"
+                # a repeat run that serves wrong data invalidates the point
+                # just as the first one would
+                if [ "${RUN_MISMATCHES:-0}" -ne 0 ]; then
+                    echo "  !! $impl conns=$conns: repeat run served wrong content;" \
+                         "point is INVALID and will not be recorded" >&2
+                    INVALID=1
+                    break
+                fi
             fi
         done
+
+        if [ "$INVALID" = "1" ]; then
+            break
+        fi
     done
+    [ "$INVALID" = "1" ] && break
 done
 
 fi # RUN_TIMING
+
+# A run that served wrong data is not evidence about throughput, so the strace
+# pass is skipped too rather than quietly adding syscall counts to the CSVs.
+if [ "${INVALID:-0}" = "1" ]; then
+    echo "  !! ABORTED: content verification failed; no point from this run was" \
+         "recorded, and the strace pass was skipped" >&2
+    exit 1
+fi
 
 if [ "${SKIP_STRACE:-0}" != "1" ]; then
     STRACE=1 run_strace_pass

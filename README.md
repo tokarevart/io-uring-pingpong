@@ -92,6 +92,24 @@ overcount whenever TCP splits or coalesces a logical message across
 completions. Both servers count the same way, and the client counts
 independently (echo fully received), so the two sides can be cross-checked.
 
+### Every echo is content-verified
+
+Counting a full-length echo proves nothing about *which* request it was. Every
+request therefore carries a 16-byte tag — a per-run nonce, the connection's
+global index, and that request's sequence number — and the client compares the
+echo against it.
+
+This guards the `io_uring` server's most delicate invariant. The provided buffer
+must be held until the `send` reading from it completes; a buffer recycled early
+still yields a full-length echo of the *wrong bytes*, which a length check
+cannot detect. Without this the benchmark had no way to catch that failure and
+would have reported a clean rps for a corrupting server.
+
+On mismatch the client exits non-zero and `bench.sh` aborts the sweep without
+recording the point, so wrong data can never be plotted as a fast result. The
+check was validated against a deliberately injected fault; see
+[Correctness: every echo is verified](RESULTS.md#correctness-every-echo-is-verified).
+
 ---
 
 ## The two servers
@@ -142,7 +160,8 @@ A buffer is owned by the kernel from the moment `recv` completes with
   close the fd
 
 Recycling early "works" under low load and corrupts data under load, which is
-why it's called out here.
+why it's called out here — and why the client verifies echo *content*, not just
+length. That is the only thing that actually detects a violation of this rule.
 
 #### `user_data` packing and fd reuse
 
@@ -317,12 +336,30 @@ Headline, on this box:
 
 | | epoll | io_uring |
 |---|---:|---:|
-| throughput @512 conns | 106,043 rps | **152,482 rps** (1.44x) |
-| syscalls per transaction | 2.041 | **0.0261** (~78x fewer) |
-| `read`/`write` in hot path | 12,706 | **0** |
+| throughput @512 conns | 112,106 rps | **159,360 rps** (1.42x) |
+| syscalls per transaction | 2.046 | **0.026** (~79x fewer) |
+| `read`/`write` in hot path | one each per txn | **0** |
 
-Server CPU was 99.3–101.3% in every run, and the client had headroom at 64 and
+Server CPU was 99.0–101.3% in every run, and the client had headroom at 64 and
 512 connections, so the server was the bottleneck throughout.
+
+### Where the remaining time goes
+
+A CPU profile of both servers (`perf record -e cpu-clock`; this box is WSL2 and
+exposes no PMU, so `cycles` is unavailable) puts io_uring at **6.37 µs per
+transaction**, of which:
+
+- **4.86 µs (76%) is TCP + IP + netfilter work that both implementations pay
+  identically** and no `io_uring` feature can touch
+- **0.32 µs is `io_uring` core** — versus the ~2.8 µs of syscall and VFS entry
+  path (`do_syscall_64`, `vfs_read`, `sock_read_iter`, …) it replaces
+- **the userspace event loop measures 0.00%**, below the sampling floor
+
+The same profile **rules out three optimisations** before they are attempted:
+`IORING_RECVSEND_POLL_FIRST` (`io_arm_poll_handler` at 0.00% of stacks — recv
+always completes inline), `CQE_SKIP_SUCCESS` (completion posting is 0.31% of
+CPU), and `SQPOLL` (`io_uring_enter` is 0.04%). Details and the full breakdown
+in [Where the time actually goes](RESULTS.md#where-the-time-actually-goes).
 
 ---
 
@@ -331,11 +368,20 @@ Server CPU was 99.3–101.3% in every run, and the client had headroom at 64 and
 - The margin shown here is specific to this shape: **64-byte synchronous
   ping-pong over loopback, single-threaded servers, `TCP_NODELAY`**. It does
   not transfer to streaming, large payloads, or real NICs.
+- **The result is close to structural, not an early point on a curve.** With
+  76% of io_uring's per-transaction time in a socket-path floor it shares with
+  `epoll`, and only 0.32 µs of its own machinery, there is no further
+  order-of-magnitude win available on the ring side for this workload.
 - Loopback means the kernel's networking path is exercised but no NIC, no
-  DMA, and no real NIC interrupt cost.
+  DMA, and no real NIC interrupt cost. On this VM, netfilter conntrack, NAT,
+  iptables and SELinux account for **13.6%** of server CPU — real cost, but an
+  artefact of the environment rather than of either event engine.
 - `send_zc` (zero-copy send) is deliberately **not** used — it complicates send
   accounting and adds noise. It would likely widen the gap, but that's a
   separate experiment.
 - Syscall counts are the most portable result here: they don't depend on who
   wins the CPU race, and they directly substantiate the syscall-elimination
-  claim.
+  claim. The profile's attribution of that same win to the VFS/syscall path is
+  corroborating evidence from an independent measurement.
+- The io_uring server is single-threaded **and single-ring**. Several workers
+  would scale it, but that changes the question being asked.
