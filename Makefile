@@ -32,8 +32,8 @@ build/uring_srv: LIBS = $(LDFLAGS_URING)
 # Timing matrix for both transports + short syscall-counting passes, then the
 # tables. Sweeps tcp and udp by default (PROTO_LIST); they write separate CSVs
 # and report.py prints separate tables, since udp rps is not comparable.
-# Overrides (RUNS, DURATION, CONNS_LIST, ...) are all honoured, but the defaults
-# are deliberately short -- keep end-to-end runs well under a minute.
+# Overrides (DURATION, CONNS_LIST, ...) are all honoured, but the defaults are
+# deliberately short -- one 3s run per point, so a full sweep is about a minute.
 bench: build
 	./bench.sh
 	./report.py
@@ -60,17 +60,15 @@ bench-quick: build
 	@tmp=$$(mktemp); \
 	trap 'rm -f "$$tmp"; exit 130' INT TERM; \
 	trap 'rm -f "$$tmp"' EXIT; \
-	CONNS_LIST=$(CONNS) IMPLS=$(IMPLS) RUNS=1 WARMUP=1 DURATION=3 SKIP_STRACE=1 \
+	CONNS_LIST=$(CONNS) IMPLS=$(IMPLS) WARMUP=1 DURATION=3 SKIP_STRACE=1 \
 		RESULTS_CSV="$$tmp" PROTO_LIST=$(PROTO) ./bench.sh; \
 	./report.py "$$tmp" "" "quick run"
 
-# CPU profile of a server, with the gates in profile.sh that make the result
-# mean something (privileges, kernel samples actually landing, stacks actually
-# unwinding). Override with `make prof IMPL=epoll MODE=stat`.
+# CPU profile of a server. Override with `make prof IMPL=epoll MODE=stat`.
 IMPL ?= uring
 MODE ?= fp
 prof: build
-	./profile.sh $(IMPL) $(MODE)
+	@./profile.sh $(IMPL) $(MODE)
 
 report:
 	./report.py

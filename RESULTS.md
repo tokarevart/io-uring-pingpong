@@ -6,8 +6,8 @@ All numbers below come from the recorded data in this repo:
 Environment as captured in [`results/env.txt`](results/env.txt).
 
 Re-print this table at any time with `make report` (instant, reads the CSVs only).
-Regenerate it with `make bench` (~24s end to end); `RUNS=3` (~60s) produces the
-medians recorded here.
+Regenerate it with `make bench`, which takes about a minute end to end: one 3s
+run per point, plus warmups and two strace passes.
 
 ## Environment
 
@@ -20,29 +20,30 @@ medians recorded here.
 | Topology | loopback (`127.0.0.1`), 64-byte payloads, `TCP_NODELAY` |
 | Pinning | server → cpu0; client workers → cpu2,4,6,8 (one logical cpu per physical core; cpu1 excluded as cpu0's SMT sibling) |
 | Client | 4 worker processes, `poll()`, one per physical core |
-| Protocol | 1s warmup per implementation, 3s measurement window, 3 runs per point (median) |
+| Protocol | 1s warmup per implementation, 3s measurement window, one run per point |
 
 No `cpfreq` interface is exposed, so the governor cannot be pinned.
 
 ### Run-to-run variation
 
-Relative standard deviation across the 3 runs behind each point:
+Every point here is a **single 3s run**, so the harness has no per-point spread to
+show. That is deliberate, and made after measuring it: an earlier sweep ran each
+point 3 times and gave relative standard deviations of 1.43%/2.34% at 64 conns,
+0.19%/1.28% at 512, and 6.51%/4.05% at 4096 (epoll/io_uring). Worst cell
+**6.51%**, against a 38–48% effect — roughly a 7x margin — so repeating a point
+buys no resolution the headline does not already have, while tripling the wall
+time of every sweep.
 
-| conns | epoll | io_uring |
-|---:|---:|---:|
-| 64 | 1.43% | 2.34% |
-| 512 | 0.19% | 1.28% |
-| 4096 | 6.51% | 4.05% |
+The number to read is the **speedup**, not the rps. Absolute throughput on this
+shared VM drifts a few percent between full sweeps, so a few percent of rps
+difference between two sweeps means nothing; the ratio holds because both arms
+drift together. The 4096 point was the noisy one for both implementations back
+when it was measured, because at that connection count the client sits at
+~98–100% of its 400% ceiling and is exposed to contention from the load
+generator itself.
 
-Worst cell is **6.51%** (epoll at 4096), against a 35–51% effect — a 5x margin.
-The 4096 point is the noisy one for **both** implementations (epoll 6.51%,
-io_uring 4.05%): at that connection count the client sits at 98–100% of its 400%
-ceiling, so this point is the one most exposed to contention from the load
-generator itself. Absolute throughput on this shared VM drifts a few percent
-between full runs, so treat the speedup as the figure and the rps as approximate.
-
-UDP is markedly quieter — worst cell 2.02%, and 0.18–1.38% at 64/512/4096 —
-because no connection setup or teardown happens inside the window at all.
+UDP was quieter still (worst cell 2.02%), since no connection setup or teardown
+happens inside the window at all.
 
 ---
 
@@ -127,11 +128,11 @@ gained throughput from the extra workers.
 
 | conns | epoll rps | io_uring rps | speedup |
 |------:|----------:|-------------:|--------:|
-| 64 | 93,912 | **141,557** | 1.51x |
-| 512 | 115,083 | **161,759** | 1.41x |
-| 4096 | 114,771 | **155,321** | 1.35x |
+| 64 | 94,504 | **139,941** | 1.48x |
+| 512 | 114,726 | **158,259** | 1.38x |
+| 4096 | 112,067 | **155,466** | 1.39x |
 
-**io_uring is 1.35x–1.51x faster across the whole sweep.**
+**io_uring is 1.38x–1.48x faster across the whole sweep.**
 
 ---
 
@@ -140,18 +141,18 @@ gained throughput from the extra workers.
 `strace -c` attached to the server, 64 connections, 1s window. A single point
 suffices because the *per-transaction* rate is stable across connection counts.
 
-**epoll** — 6,509 transactions in 1.0s, 13,301 syscalls
-**io_uring** — 108,901 transactions in 1.0s, 2,830 syscalls
+**epoll** — 6,423 transactions in 1.0s, 13,111 syscalls
+**io_uring** — 109,961 transactions in 1.0s, 2,855 syscalls
 
 | | epoll | io_uring |
 |---|---:|---:|
-| **syscalls per transaction** | **2.044** | **0.0260** |
+| **syscalls per transaction** | **2.041** | **0.0260** |
 | `read`/`write` in hot path | one each per txn | **0** |
-| `io_uring_enter` | 0 | ~2,800 |
-| total | 13,301 | 2,830 |
-| transactions in the same window | 6,509 | **108,901** |
+| `io_uring_enter` | 0 | ~2,850 |
+| total | 13,111 | 2,855 |
+| transactions in the same window | 6,423 | **109,961** |
 
-**~79x fewer syscalls per transaction**, and 4.6x fewer in total over a window
+**~78x fewer syscalls per transaction**, and 4.6x fewer in total over a window
 long enough to compare rates fairly.
 
 The structural difference: `epoll` issues exactly one `read` and one `write` per
@@ -172,13 +173,13 @@ so one transport can never delete the other's evidence.
 
 The second transport (`results/udp.csv`, run with `PROTO_LIST=udp`). Both sides
 are stateless — one socket, no accept/connect/close, nothing per client — so the
-comparison isolates the syscall tax and nothing else. 3 runs per point, medians.
+comparison isolates the syscall tax and nothing else. One run per point.
 
 | conns | epoll rps | io_uring rps | speedup |
 |------:|----------:|-------------:|--------:|
-| 64 | 157,780 | **182,582** | 1.16x |
-| 512 | 191,564 | **219,317** | 1.14x |
-| 4096 | 195,312 | **218,612** | 1.12x |
+| 64 | 158,602 | **182,074** | 1.15x |
+| 512 | 190,306 | **208,783** | 1.10x |
+| 4096 | 186,126 | **218,579** | 1.17x |
 
 Server CPU 99.3–100.0% throughout, all 9 points verified with `mismatches=0`.
 
@@ -211,14 +212,14 @@ budget rather than an artefact of a capped load generator.
 
 | | epoll | io_uring |
 |---|---:|---:|
-| transactions in the window | 6,794 | 144,969 |
-| total syscalls | 13,693 | 2,932 |
-| **syscalls per transaction** | **2.016** | **0.0202** |
+| transactions in the window | 6,604 | 139,476 |
+| total syscalls | 13,326 | 2,821 |
+| **syscalls per transaction** | **2.018** | **0.0202** |
 | | | **~100x fewer** |
 
 That is a *bigger* syscall reduction than TCP's 78x — epoll still pays exactly
 two calls per datagram (`recvfrom` + `sendto`), and io_uring still pays none.
-And yet the throughput win is much smaller: **1.10x against TCP's 1.41x**.
+And yet the throughput win is much smaller: **1.10x against TCP's 1.38x**.
 
 ### The prediction was wrong, and the profile says why
 
@@ -259,7 +260,17 @@ the reply needs a destination address.
 ## How the profile was produced
 
 Every CPU attribution below comes from [`profile.sh`](profile.sh), run as
-`make prof IMPL=<impl> MODE=<fp|flat|stat>`. That script exists because
+`make prof IMPL=<impl> MODE=<fp|flat|stat>`. It prints two views, and the
+distinction is what makes the numbers below readable. **Cumulative** (`--children`)
+is how much time sits *under* a symbol; **self** (`--no-children`) is what a
+symbol burns itself. Cumulative is the one that localises cost: it puts 95.16%
+of samples under `__io_issue_sqe` and 79.84% under `tcp_sendmsg_locked`. The
+self view ranks leaves, topping out at `_raw_spin_unlock_irqrestore` at 9.90%,
+where its top 20 symbols together account for well under a quarter of the
+profile — call sites, not costs. Reporting only the self view is what made this
+workload look like it was spending its time in spinlocks.
+
+That script exists because
 this measurement went wrong silently three times before it was pinned down:
 
 * `perf -g none` — perf parses `none` as a **workload name**, reports "Failed to
@@ -272,10 +283,12 @@ this measurement went wrong silently three times before it was pinned down:
   `/proc/kallsyms` are also zeroed for non-root, so a sampled kernel IP could not
   be named even if one were collected.
 
-So `profile.sh` checks the privilege gates up front and **refuses**, then checks
-the artefact afterwards: that kernel frames actually landed, and that stacks
-actually unwound (mean depth ≥ 5). Each failure mode above is now a hard error
-rather than a plausible-looking number.
+Of those, only the third still needs a check: it is the one that returns a
+confident-looking table describing no kernel time. So `profile.sh` uses root when
+it has it and carries on unprivileged when it doesn't, and refuses only if the
+artefact has zero kernel samples or mean stack depth < 5. The recording-order
+mistake is fixed structurally — perf starts in the background and the client is
+launched *inside* the window — and `-g none` was never a real invocation.
 
 | impl / proto | samples | with kernel frames | mean depth | perf.data |
 |---|---:|---:|---:|---:|
@@ -513,10 +526,10 @@ the event engine.
 
 ## Honest reading
 
-- The **1.35x–1.51x throughput** margin is specific to 64-byte synchronous
+- The **1.38x–1.48x throughput** margin is specific to 64-byte synchronous
   ping-pong over loopback with single-threaded servers. It does not transfer to
   streaming, large payloads, or real NICs.
-- The **~79x syscall-per-transaction** reduction is the structural result. It is
+- The **~78x syscall-per-transaction** reduction is the structural result. It is
   a property of the design (multishot + provided buffers + batching), not of
   this workload, and it is what would carry over — though not the magnitude of
   any throughput benefit.
@@ -525,7 +538,7 @@ the event engine.
   the practical ceiling for this shape, not an early point on a curve.
 - **The margin is a property of the operation, not just of io_uring.** The same
   design on UDP cuts syscalls per transaction by ~100x — *more* than TCP's 78x —
-  and buys only 1.14x instead of 1.41x, because `recvfrom`/`sendto` does far less
+  and buys only 1.10x instead of 1.38x, because `recvfrom`/`sendto` does far less
   kernel work per operation than `read`/`write` does. The bigger the operation,
   the more of it syscall entry represents, and the more there is to win.
 - io_uring **loses** on this benchmark if implemented naively with one-at-a-time

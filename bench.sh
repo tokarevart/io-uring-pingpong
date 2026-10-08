@@ -61,7 +61,6 @@ MSG_SIZE=64
 WARMUP=${WARMUP:-1}
 DURATION=${DURATION:-3}
 NODELAY=${NODELAY:-1}
-RUNS=${RUNS:-1}
 IMPLS=${IMPLS:-"epoll uring"}
 # A point only measures the server if the server was saturated. A run that
 # under-saturates is a failed measurement, not a slow one -- it means something
@@ -128,7 +127,7 @@ CLIENT_CPU_LIST="${CLIENT_CPU_BASE}-${LAST_CPU}"
     echo "ncpu=$NCPU"
     echo "gcc=$(gcc --version | head -1)"
     echo "liburing=$(ls /lib64/liburing.so.* 2>/dev/null | head -1 | xargs -r basename)"
-    echo "runs=$RUNS duration_s=$DURATION warmup_s=$WARMUP workers=$WORKERS msg_size=$MSG_SIZE"
+    echo "duration_s=$DURATION warmup_s=$WARMUP workers=$WORKERS msg_size=$MSG_SIZE"
     echo "protos=$PROTO_LIST"
     echo "server_cpu=$SERVER_CPU siblings=$server_sibling client_cpus=$CLIENT_CPU_LIST"
 } > "$OUTDIR/env.txt" 2>/dev/null || true
@@ -377,8 +376,8 @@ run_strace_pass() {
 # their rps are not comparable.
 #
 # A full sweep is deliberately quiet while a run is in flight (the client holds
-# the CPU for DURATION seconds with nothing to print), and RUNS=3 across both
-# transports is a few minutes. So print before each run and stamp every line with
+# the CPU for DURATION seconds with nothing to print), and one sweep across both
+# transports is about a minute. So print before each run and stamp every line with
 # elapsed time: a sweep that is progressing and one that is wedged should never
 # look the same.
 SWEEP_START=$(date +%s)
@@ -392,7 +391,7 @@ for PROTO in $PROTO_LIST; do
         # start from a clean file. Set APPEND=1 to merge, or RESULTS_CSV= to
         # redirect (which is how bench-quick avoids clobbering recorded data).
         if [ "${APPEND:-0}" != "1" ] || [ ! -f "$CSV" ]; then
-            echo "impl,conns,run,completed,elapsed,rps,server_cpu_pct,client_cpu_pct,workers" > "$CSV"
+            echo "impl,conns,completed,elapsed,rps,server_cpu_pct,client_cpu_pct,workers" > "$CSV"
         fi
         echo "writing to $CSV"
     fi
@@ -425,8 +424,8 @@ for PROTO in $PROTO_LIST; do
             # the accept queue). Retry rather than record a bogus zero.
             attempt=0
             while :; do
-                # whichever attempt succeeds is recorded as run 1
-                printf "  %-5s %-3s conns=%-5s run=1 measuring %ss (attempt %s) ... (%s)\n" \
+                # whichever attempt succeeds is the recorded result
+                printf "  %-5s %-3s conns=%-5s measuring %ss (attempt %s) ... (%s)\n" \
                     "$impl" "$PROTO" "$conns" "$DURATION" "$((attempt + 1))" "$(elapsed)" >&2
                 run_once "$impl" "$conns" "$port" "$DURATION"
                 completed="$RUN_COMPLETED"
@@ -480,37 +479,10 @@ for PROTO in $PROTO_LIST; do
                 break
             fi
 
-            for run in $(seq 1 "$RUNS"); do
-                rps=$(awk -v c="$completed" -v t="$elapsed" 'BEGIN{if(t>0)printf "%.1f",c/t;else print 0}')
-                echo "$impl,$conns,$run,$completed,$elapsed,$rps,$cpu_pct,$client_cpu,$WORKERS" >> "$CSV"
-                printf "  %-5s %-3s conns=%-5s run=%s completed=%-9s rps=%-9s srv_cpu=%s%% cli_cpu=%s%%  (%s)\n" \
-                    "$impl" "$PROTO" "$conns" "$run" "$completed" "$rps" "$cpu_pct" "$client_cpu" "$(elapsed)"
-                # more than one sample per point: re-measure each time
-                if [ "$run" -lt "$RUNS" ]; then
-                    printf "  %-5s %-3s conns=%-5s run=%s measuring %ss ... (%s)\n" \
-                        "$impl" "$PROTO" "$conns" "$((run + 1))" "$DURATION" "$(elapsed)" >&2
-                    run_once "$impl" "$conns" "$port" "$DURATION"
-                    completed="$RUN_COMPLETED"
-                    elapsed="$RUN_ELAPSED"
-                    cpu_pct="$RUN_CPU_PCT"
-                    client_cpu="$RUN_CLIENT_CPU"
-                    # a repeat run that serves wrong data invalidates the point
-                    # just as the first one would
-                    if [ "${RUN_MISMATCHES:-0}" -ne 0 ]; then
-                        echo "  !! $impl $PROTO conns=$conns: repeat run served wrong" \
-                             "content; point is INVALID and will not be recorded" >&2
-                        INVALID=1
-                        break
-                    fi
-                    if [ -n "$cpu_pct" ] && [ "$cpu_pct" != "NA" ] && \
-                       awk -v c="$cpu_pct" -v m="$MIN_SRV_CPU" 'BEGIN{exit !(c+0 < m+0)}'; then
-                        echo "  !! $impl $PROTO conns=$conns: repeat run under-saturated" \
-                             "(${cpu_pct}% < ${MIN_SRV_CPU}%); point NOT recorded" >&2
-                        UNDER_SATURATED=1
-                        break
-                    fi
-                fi
-            done
+            rps=$(awk -v c="$completed" -v t="$elapsed" 'BEGIN{if(t>0)printf "%.1f",c/t;else print 0}')
+            echo "$impl,$conns,$completed,$elapsed,$rps,$cpu_pct,$client_cpu,$WORKERS" >> "$CSV"
+            printf "  %-5s %-3s conns=%-5s completed=%-9s rps=%-9s srv_cpu=%s%% cli_cpu=%s%%  (%s)\n" \
+                "$impl" "$PROTO" "$conns" "$completed" "$rps" "$cpu_pct" "$client_cpu" "$(elapsed)"
 
             if [ "$INVALID" = "1" ] || [ "$UNDER_SATURATED" = "1" ]; then
                 break

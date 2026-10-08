@@ -19,14 +19,13 @@ make bench           # tcp + udp timing matrix + syscall passes, then the tables
 make bench-udp       # udp only
 make report          # re-print the tables from existing CSVs (instant, no re-run)
 make strace          # re-run only the syscall-counting passes, then report
-make prof            # CPU profile of the uring server, with gates
+make prof            # CPU profile of the uring server
 ```
 
-The default `make bench` (1 run per point) finishes in about 45 seconds.
-`RUNS=3` medians take roughly **two minutes**, because the sweep is then 12
-points x 3 runs plus warmups and two strace passes. Each run prints before it
-starts and stamps every line with elapsed time, so a progressing sweep is never
-mistaken for a wedged one. `make bench`
+`make bench` finishes in about a minute: 12 points at one 3s run each, plus
+warmups and two strace passes. Each run prints before it starts and stamps every
+line with elapsed time, so a progressing sweep is never mistaken for a wedged
+one. `make bench`
 is the only target that measures anything, and it does both passes: the timing
 matrix at 3s per point, then a 1s strace pass, so syscall counts are always in
 its output. The strace window is shorter because that pass *counts* syscalls
@@ -55,10 +54,11 @@ finished releasing, or a connection burst that outruns the accept queue) is
 **retried up to 3 times** rather than recorded, and `report.py` drops any
 zero-result row with a warning rather than plotting it as `0 rps`.
 
-For tighter bounds, raise `RUNS` — the report then shows the **median** across
-repeats and states how many runs went into each point. Keep the total in mind:
-this is a latency-sensitive measurement on a shared box, so more repeats means
-proportionally longer runs.
+There is no `RUNS` knob: each point is measured once. That was a deliberate
+change, made after measuring the spread — worst-cell run-to-run standard
+deviation of 6.51% against a 38–48% effect, so repeats bought no resolution the
+headline did not already have. `APPEND=1 ./bench.sh` still stacks a second sweep
+into the same CSV, and `report.py` takes the median of whatever rows it finds.
 
 Other overrides (all env vars):
 
@@ -326,17 +326,17 @@ Every run records server CPU utilisation (`utime+stime` from
 - **3s** measurement window
 - **1 run** per point
 
-A 3s window is enough: the effect is ~45% while the worst measured run-to-run
-standard deviation is 2.27% — a ~20x margin. Per-cell variation is tabulated in
+A 3s window is enough: the effect is ~38–48% while the worst measured run-to-run
+standard deviation is 6.51% — a ~7x margin, so one run per point resolves the
+result. The spread measurement behind that decision is in
 [`RESULTS.md`](RESULTS.md).
 
-Raise `RUNS` for tighter bounds; the report then shows the **median** across
-repeats and states how many runs went into each point (or `mixed run counts` if
-they differ).
+`report.py` reports the **median** of the rows behind each cell and says how many
+went into it, so `APPEND=1` merges still aggregate sensibly.
 
 The table shows one right-aligned number per cell and nothing else. Spread is
-not rendered, to keep every cell the same width; the raw `run` column in the
-CSV is there when you want to compute it yourself.
+not rendered, to keep every cell the same width; the raw CSVs are there when you
+want to compute it yourself.
 
 An environment snapshot (kernel, CPU, gcc, liburing, and the exact settings
 used) is written to `results/env.txt` alongside every run, so a CSV stays
@@ -375,20 +375,20 @@ Full write-up in [`RESULTS.md`](RESULTS.md); raw data in
 [`results/bench.csv`](results/bench.csv).
 
 Re-print the table at any time with `make report` (instant, no re-run).
-Regenerate it with `make bench` (~24s; medians of 3 runs with `RUNS=3`).
+Regenerate it with `make bench` (~1 minute; one run per point).
 
 Headline, on this box:
 
 | | epoll | io_uring |
 |---|---:|---:|
-| throughput @512 conns, tcp | 115,083 rps | **161,759 rps** (1.41x) |
-| throughput @512 conns, udp | 191,564 rps | **219,317 rps** (1.14x) |
-| syscalls per transaction, tcp | 2.044 | **0.0260** (~79x fewer) |
-| syscalls per transaction, udp | 2.016 | **0.0202** (~100x fewer) |
+| throughput @512 conns, tcp | 114,726 rps | **158,259 rps** (1.38x) |
+| throughput @512 conns, udp | 190,306 rps | **208,783 rps** (1.10x) |
+| syscalls per transaction, tcp | 2.041 | **0.0260** (~78x fewer) |
+| syscalls per transaction, udp | 2.018 | **0.0202** (~100x fewer) |
 | `read`/`write` in hot path | one each per txn | **0** |
 | echoes failing content check | 0 | **0** |
 
-Server CPU was 99.0–100.7% in every run, and the client had headroom at 64 and
+Server CPU was 99.3–101.0% in every run, and the client had headroom at 64 and
 512 connections, so the server was the bottleneck throughout.
 
 A point whose server did not saturate is **not recorded**: `bench.sh` retries it
@@ -397,8 +397,8 @@ measurement rather than a slow one. See
 [A point is only a measurement if the server saturated](RESULTS.md#a-point-is-only-a-measurement-if-the-server-saturated).
 
 **The margin is a property of the operation, not just of io_uring.** UDP cuts
-syscalls per transaction by *more* (~100x vs ~79x) and yet wins by *less*
-(1.14x vs 1.41x), because syscall entry is a larger share of a stream
+syscalls per transaction by *more* (~100x vs ~78x) and yet wins by *less*
+(1.10x vs 1.38x), because syscall entry is a larger share of a stream
 read/write than of a datagram `recvfrom`/`sendto`. The heavier the operation, the
 more there is to win.
 
@@ -423,14 +423,28 @@ measured free (−0.8% to +2.6% across the four impl/transport combinations, all
 inside run-to-run noise) because at `-O3` these servers inline down to ~11
 symbols and userspace is ~0.3% of samples.
 
+It prints the client tally and then **two** hot-symbol tables, and nothing else:
+
+- **cumulative (inclusive)** — how much time is spent *under* a symbol
+- **self (exclusive)** — how much a symbol burns on its own
+
+Only the first one localises the cost. It puts ~95% of samples under
+`__io_issue_sqe` and ~80% under `tcp_sendmsg_locked`, which is the whole story
+of where an io_uring server spends a transaction. The exclusive view tops out at
+`_raw_spin_unlock_irqrestore` — a leaf nobody can act on — and its top 20
+symbols sum to well under a quarter of the profile, so it ranks call sites
+rather than costs. Full trees land in `results/prof/report-cumulative.txt` and
+`report-self.txt`; `sudo perf report -i results/prof/perf.data` opens the
+interactive view.
+
 `profile.sh` exists because this measurement failed silently three times: `perf
 -g none` is parsed as a workload name and records nothing; recording before
 starting the client profiles an idle server; and with `perf_event_paranoid=2`
 unprivileged perf silently appends `:u` to every event and returns a
-"successful" profile containing **no kernel samples at all**. So the script
-refuses on the privilege gates, then verifies the artefact — kernel frames
-actually present, mean stack depth ≥ 5 — and exits non-zero rather than reporting
-a plausible-looking number.
+"successful" profile containing **no kernel samples at all**. It now runs
+unprivileged rather than refusing, and checks only the failure that produces a
+confidently wrong table — zero kernel samples — plus stack depth ≥ 5. Those
+stay silent unless they trip.
 
 On this box the profile then says:
 

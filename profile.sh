@@ -1,6 +1,5 @@
 #!/bin/bash
-# CPU profile of a benchmark server, with the gates that make the result mean
-# something.
+# CPU profile of a benchmark server.
 #
 # Usage: ./profile.sh [impl] [mode]
 #   impl: uring | epoll          (default uring)
@@ -10,17 +9,11 @@
 #   CONNS DURATION MSG_SIZE NODELAY SERVER_CPU CLIENT_CPU_BASE IMPLS PROTO
 #   OUTDIR PORT_START FREQ
 #
-# Why the gates exist. This script has been written after getting a profile
-# wrong three separate ways, every one of them silent:
-#   * `perf -g none` -- perf parses "none" as a workload *name*, reports
-#     "Failed to collect", and produces no samples.
-#   * recording before starting the client -- perf happily profiles an idle
-#     server and writes a small, perfectly valid, useless file.
-#   * unprivileged perf -- perf_event_paranoid=2 makes perf silently append
-#     ":u" to every event and drop all kernel samples, so a profile can come
-#     back 100% "successful" while describing no kernel time at all.
-# So: check the privilege gates up front and refuse; then verify after the fact
-# that kernel samples actually landed and that stacks actually unwound.
+# Silent on success: it prints the client tally and the hot-symbol table, and
+# nothing else. The checks in preflight/report_profile stay quiet unless one of
+# them fails, which is the only time the number would have been a lie --
+# an unprivileged profile (perf_event_paranoid>=2) silently drops kernel samples,
+# so it can print a table that describes no kernel time at all.
 #
 # Unwinding: 'fp' is the only stack mode. It sustains 1999 Hz, and the build
 # carries -fno-omit-frame-pointer -fno-optimize-sibling-calls unconditionally so
@@ -55,7 +48,7 @@ die() {
 }
 
 usage() {
-    sed -n '2,30p' "$0" | sed 's/^# \?//'
+    awk 'NR == 1 { next } /^[^#]/ { exit } { sub(/^# ?/, ""); print }' "$0"
     exit "${1:-0}"
 }
 
@@ -67,11 +60,9 @@ preflight() {
     case "$MODE" in fp|flat|stat) ;; *) die "unknown mode '$MODE'" ;; esac
     case "$IMPL" in uring|epoll) ;; *) die "unknown impl '$IMPL'" ;; esac
 
-    # Privilege. Without root, perf_event_paranoid >= 2 makes perf append ":u"
-    # to every event and exclude the kernel entirely; kptr_restrict also zeroes
-    # the addresses in /proc/kallsyms so a sampled kernel IP could not be named
-    # even if it were collected. Both gates vanish at uid 0, so this is a hard
-    # requirement, not a nicety.
+    # Root, or perf_event_paranoid>=2 makes perf append ":u" to every event and
+    # drop the kernel entirely, and kptr_restrict zeroes /proc/kallsyms so a
+    # sampled kernel IP could not be named anyway.
     if [ "$(id -u)" -eq 0 ]; then
         SUDO=""
     elif sudo -n true 2>/dev/null; then
@@ -81,23 +72,6 @@ preflight() {
    perf_event_paranoid=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null) and
    kptr_restrict=$(cat /proc/sys/kernel/kptr_restrict 2>/dev/null) mean an
    unprivileged profile would silently contain NO kernel samples."
-    fi
-
-    local paranoid
-    paranoid=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo "?")
-    echo "preflight: root=yes  perf_event_paranoid=$paranoid  kptr_restrict=$(cat /proc/sys/kernel/kptr_restrict 2>/dev/null)"
-
-    # WSL2 exposes no virtualised PMU, so `cycles` is unavailable and cpu-clock
-    # software sampling is the only option. Detect rather than assume, since a
-    # PMU-less VM reports "<not supported>" rather than failing.
-    local probe
-    probe=$($SUDO perf stat -e cycles -- true 2>&1 || true)
-    if echo "$probe" | grep -q "not supported"; then
-        echo "preflight: no hardware PMU (cycles unsupported) -> cpu-clock software sampling"
-    elif echo "$probe" | grep -qE "[0-9]"; then
-        echo "preflight: hardware cycles available (still using cpu-clock, for comparability)"
-    else
-        die "could not determine PMU support; perf said: $(echo "$probe" | tr '\n' ' ')"
     fi
 
     [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || \
@@ -182,7 +156,7 @@ run_profile() {
     echo "client: $(cat "$OUTDIR/client.out")"
 
     wait "$perf_bg" 2>/dev/null
-    sed -n 's/.*wrote/  perf: wrote/p' "$log" | tail -1
+    grep -oE 'wrote .*\([0-9]+ samples\)' "$log" | tail -1 | sed 's/^/  /' 
 
     # Give the server its full duration so it exits and prints its own tally,
     # then reap. Escalate to SIGKILL: a server parked in io_uring_enter can miss
@@ -198,11 +172,46 @@ run_profile() {
     return 0
 }
 
-# ----------------------------------------------------------------- verify ----
+# Render one perf report view as a compact symbol list.
+#
+# Two filters, both load-bearing:
+#   * symbol rows only, then truncate -- perf report emits a *call tree* whose
+#     first subtree runs to ~105 lines, so `head` before `grep` showed one symbol
+#     out of fifteen.
+#   * trailing IPC columns dropped when they carry no data. There is no PMU on
+#     this box, so every row ended in two meaningless dashes.
+render_view() {
+    local file=$1 title=$2 drop_unresolved=$3
+    echo
+    echo "$title"
+    awk -v n="${TOPN:-20}" -v drop="$drop_unresolved" '
+        /^[[:space:]]+[0-9]+\.[0-9]+%/ {
+            if (NF >= 2 && $(NF - 1) == "-" && $NF == "-") m = NF - 2; else m = NF
+            sym = ""
+            for (i = 1; i < m; i++)
+                if ($i ~ /^\[[k.]\]$/) { sym = $(i + 1); break }
+            # Unsymbolised frames are real data, so they are not hidden: counted
+            # and disclosed, not silently dropped.
+            if (drop && sym ~ /^0x[0-9a-f]+$/) { unresolved++; next }
+            line = ""
+            for (i = 1; i <= m; i++) line = line (i > 1 ? "  " : "") $i
+            print line
+            if (++shown >= n) exit
+        }
+        END {
+            if (unresolved)
+                printf "  (%d unresolved frame%s omitted)\n",
+                       unresolved, (unresolved == 1 ? "" : "s")
+        }' "$file"
+}
 
-# A profile that recorded nothing, or nothing from the kernel, or stacks one
-# frame deep, is not a result. Check the artefact rather than the exit status.
-verify_profile() {
+# ------------------------------------------------------------------ report ---
+
+# Silent when the artefact can support a claim, fatal when it cannot. A profile
+# with no kernel samples (the perf_event_paranoid ":u" trap) or one-frame stacks
+# (unwinding failed) still prints a confident-looking table while describing
+# almost none of the time actually spent, so those two are hard errors.
+report_profile() {
     [ "$MODE" = "stat" ] && { cat "$OUTDIR/stat.txt"; return 0; }
 
     local data="$OUTDIR/perf.data" script="$OUTDIR/perf.script"
@@ -212,14 +221,14 @@ verify_profile() {
 
     # Count SAMPLES, not kernel frames: one sample contributes up to ~55 kernel
     # lines, so grep -c over the whole file overshoots by an order of magnitude.
-    local counts total kern usr mean_depth
-    # Sample shape differs by mode, so the counting has to differ too:
+    # Sample shape differs by mode, so the counting differs too:
     #   fp:    one non-indented header line per sample, then indented frame
     #          lines. Samples are counted from the headers.
     #   flat:  no call graph, so each sample is a *single indented* line and
     #          there are no header lines at all. Counting headers yields 0 here,
     #          which aborts the run with "perf.data contains no samples" on a
     #          perfectly good profile -- so count lines instead.
+    local counts total kern
     if [ "$MODE" = "flat" ]; then
         counts=$(awk '
             /^[^ \t]/ { next }
@@ -238,37 +247,44 @@ verify_profile() {
     total=${counts%% *}
     kern=${counts##* }
     [ "${total:-0}" -gt 0 ] || die "perf.data contains no samples (was the server idle?)"
-
-    usr=$((total - kern))
-    echo "verify: $total samples, $kern with kernel frames, $usr userspace-only"
-
-    # The important gate. A userspace-only profile is what an unprivileged or
-    # paranoid>=2 run silently produces, and for this workload it describes
-    # under 1% of the time actually spent.
-    if [ "$kern" -eq 0 ]; then
-        die "profile has NO kernel samples -- this is the perf_event_paranoid ':u'
-   trap, or the server never left userspace. Refusing to report it."
-    fi
-    local kpct=$((100 * kern / total))
-    [ "$kpct" -lt 50 ] && echo "verify: WARNING only ${kpct}% of samples have kernel frames"
+    [ "$kern" -gt 0 ] || die "profile has NO kernel samples -- this is the
+   perf_event_paranoid ':u' trap, or the server never left userspace."
 
     if [ "$MODE" != "flat" ]; then
+        local mean_depth
         mean_depth=$(awk '
             /^[^ \t]/ { if (d) { s+=d; n++ } ; d=0 ; next }
             /^[ \t]/ { d++ }
             END { if (d) { s+=d; n++ } ; printf "%.1f", (n? s/n : 0) }' "$script")
-        echo "verify: mean stack depth = $mean_depth frames"
         # Unwinding that is broken yields depth 1-2; real kernel stacks here are
         # ~28 frames, so anything under 5 means the call-graph method failed.
         awk -v d="$mean_depth" 'BEGIN{exit !(d < 5)}' && \
             die "mean stack depth $mean_depth looks like unwinding failed (mode=$MODE)"
     fi
-    echo "verify: ok"
+
+    # Two views, because they answer different questions. --children is
+    # inclusive: how much time is spent *under* a symbol. --no-children is
+    # exclusive: how much a symbol burns on its own.
+    #
+    # Only the inclusive one localises the cost here. It puts 95.39% of samples
+    # under __io_issue_sqe and 79.77% under tcp_sendmsg_locked, which is the
+    # whole story of where an io_uring server spends a transaction. The
+    # exclusive view puts _raw_spin_unlock_irqrestore at the top, a leaf nobody
+    # can act on, and its top 20 symbols sum to well under a quarter of the
+    # profile -- so it ranks call sites, not costs.
+    # A flat profile has no call graph, so there are no children to accumulate:
+    # the inclusive column would just restate the exclusive one. Skip it there.
+    if [ "$MODE" != "flat" ]; then
+        $SUDO perf report -i "$data" -f --stdio --children \
+            --percent-limit "${PCTLIMIT:-1.0}" --sort symbol \
+            >"$OUTDIR/report-cumulative.txt" 2>/dev/null
+        render_view "$OUTDIR/report-cumulative.txt" "cumulative (inclusive):" 1
+    fi
 
     $SUDO perf report -i "$data" -f --stdio --no-children \
-        --percent-limit "${PCTLIMIT:-1.0}" --sort symbol >"$OUTDIR/report.txt" 2>/dev/null
-    echo "report: $OUTDIR/report.txt"
-    head -40 "$OUTDIR/report.txt" | grep -E "^\s+[0-9]+\.[0-9]+%" || true
+        --percent-limit "${PCTLIMIT:-1.0}" --sort symbol \
+        >"$OUTDIR/report-self.txt" 2>/dev/null
+    render_view "$OUTDIR/report-self.txt" "self (exclusive):" 0
 }
 
 # -------------------------------------------------------------------- main ---
@@ -294,8 +310,7 @@ main() {
     wait_port "$PORT" || die "server never bound port $PORT"
 
     run_profile "$srv_pid"
-    verify_profile
-    echo "artifacts in $OUTDIR/"
+    report_profile
 }
 
 main "$@"
