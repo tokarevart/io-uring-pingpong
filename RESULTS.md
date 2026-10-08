@@ -30,17 +30,17 @@ Relative standard deviation across the 3 runs behind each point:
 
 | conns | epoll | io_uring |
 |---:|---:|---:|
-| 64 | 0.88% | 2.54% |
-| 512 | 1.23% | 1.25% |
-| 4096 | 2.66% | 8.57% |
+| 64 | 1.72% | 0.45% |
+| 512 | 0.55% | 1.50% |
+| 4096 | 4.66% | 4.42% |
 
-Worst cell is **8.57%** (io_uring at 4096), against a ~42–54% effect — still a
-5x margin. That cell is also visibly noisier than the rest: its three runs were
-162,645 / 149,867 / 136,978 rps, a downward drift rather than random scatter.
-At 4096 connections the client sits at 98–100% of its 400% ceiling, so this
-point is the one most exposed to contention from the load generator itself.
-Absolute throughput on this shared VM drifts a few percent between full runs, so
-treat the speedup as the figure and the rps values as approximate.
+Worst cell is **4.66%** (epoll at 4096), against a 38–54% effect — a 10x margin.
+The 4096 point is visibly the noisy one for **both** implementations (epoll
+104,666–114,898, uring 146,689–160,111): at that connection count the client
+sits at 98–100% of its 400% ceiling, so this point is the one most exposed to
+contention from the load generator itself. Absolute throughput on this shared VM
+drifts a few percent between full runs, so treat the speedup as the figure and
+the rps values as approximate.
 
 ---
 
@@ -90,9 +90,9 @@ Client CPU is recorded too, summed over workers (ceiling 400% for 4 workers):
 
 | conns | epoll client | io_uring client | % of ceiling |
 |---:|---:|---:|---:|
-| 64 | 123–125% | 153–156% | 31–39% |
-| 512 | 239–243% | 292–308% | 60–77% |
-| 4096 | 386–388% | 398–399% | 97–100% |
+| 64 | 123–125% | 158–159% | 31–40% |
+| 512 | 244–245% | 298–313% | 61–78% |
+| 4096 | 391–396% | 397–399% | 98–100% |
 
 At 64 and 512 connections the client has clear headroom, so the server is
 unambiguously the limiter. At 4096 the client is at its ceiling **and** the
@@ -104,11 +104,11 @@ gained throughput from the extra workers.
 
 | conns | epoll rps | io_uring rps | speedup |
 |------:|----------:|-------------:|--------:|
-| 64 | 92,648 | **131,186** | 1.42x |
-| 512 | 112,106 | **159,360** | 1.42x |
-| 4096 | 97,385 | **149,867** | 1.54x |
+| 64 | 94,222 | **144,766** | 1.54x |
+| 512 | 114,933 | **161,647** | 1.41x |
+| 4096 | 110,342 | **152,056** | 1.38x |
 
-**io_uring is 1.42x–1.54x faster across the whole sweep.**
+**io_uring is 1.38x–1.54x faster across the whole sweep.**
 
 ---
 
@@ -117,18 +117,18 @@ gained throughput from the extra workers.
 `strace -c` attached to the server, 64 connections, 1s window. A single point
 suffices because the *per-transaction* rate is stable across connection counts.
 
-**epoll** — 5,963 transactions in 1.0s, 12,198 syscalls
-**io_uring** — 100,054 transactions in 1.0s, 2,603 syscalls
+**epoll** — 6,380 transactions in 1.0s, 13,037 syscalls
+**io_uring** — 108,560 transactions in 1.0s, 2,826 syscalls
 
 | | epoll | io_uring |
 |---|---:|---:|
-| **syscalls per transaction** | **2.046** | **0.026** |
+| **syscalls per transaction** | **2.043** | **0.0260** |
 | `read`/`write` in hot path | one each per txn | **0** |
-| `io_uring_enter` | 0 | ~2,600 |
-| total | 12,198 | 2,603 |
-| transactions in the same window | 5,963 | **100,054** |
+| `io_uring_enter` | 0 | ~2,800 |
+| total | 13,037 | 2,826 |
+| transactions in the same window | 6,380 | **108,560** |
 
-**~79x fewer syscalls per transaction**, and 4.7x fewer in total over a window
+**~79x fewer syscalls per transaction**, and 4.6x fewer in total over a window
 long enough to compare rates fairly.
 
 The structural difference: `epoll` issues exactly one `read` and one `write` per
@@ -137,7 +137,7 @@ transaction and cannot avoid it. The `io_uring` server issues **zero**
 rings.
 
 Under `strace`, which penalises syscall entry/exit heavily, `io_uring` served
-**16.8x** more transactions than `epoll` in the same wall-clock window.
+**17.0x** more transactions than `epoll` in the same wall-clock window.
 
 ---
 
@@ -148,58 +148,59 @@ the remaining time is*, and it changes what is worth trying next.
 
 **Method.** Both servers were profiled identically at 512 connections over an 8s
 window pinned the same way as the benchmark, sampled with `perf record -e
-cpu-clock` (15.9k samples for io_uring, 15.9k for epoll). This box is WSL2 and
-exposes **no virtualised PMU** — `cycles` reports `<not supported>` even as root
+cpu-clock` (15.9k samples for io_uring, 15.8k for epoll). This box is WSL2 and
+exposes **no virtualised PMU** — `cycles` reports `< not supported>` even as root
 — so `cpu-clock` software sampling is the only option. That is a real limitation:
 there is no IPC, cache-miss, or branch data here, so this can rank functions but
-not explain *why* one is hot. Stacks (`--call-graph dwarf`, 3,945 samples) were
+not explain *why* one is hot. Stacks (`--call-graph dwarf`, 3,940 samples) were
 captured for attribution. Sampling overhead was negligible: the profiled run
-produced 156,995 rps against the benchmark's 159,360.
+produced 154,091 rps against the benchmark's 161,647.
 
 Per-transaction cost, from the sampled rates:
 
 | | rps | CPU per transaction |
 |---|---:|---:|
-| io_uring | 156,995 | 6.37 µs |
-| epoll | 108,880 | 9.18 µs |
-| | | **saving: 2.81 µs** |
+| io_uring | 154,091 | 6.49 µs |
+| epoll | 114,266 | 8.75 µs |
+| | | **saving: 2.26 µs** |
 
 Self time grouped by subsystem:
 
 | bucket | io_uring | epoll | delta µs/txn |
 |---|---:|---:|---:|
-| TCP | 22.49% (1.43) | 16.98% (1.56) | −0.13 |
-| IP / net core | 19.36% (1.23) | 15.08% (1.39) | −0.15 |
-| locks / RCU / irq / Hyper-V | 17.36% (1.11) | 19.09% (1.75) | −0.65 |
-| netfilter / NAT / SELinux | 13.61% (0.87) | 13.99% (1.29) | −0.42 |
-| other kernel | 18.51% (1.18) | 28.58% (2.63) | **−1.45** |
-| slab / page / memset | 1.89% (0.12) | 1.46% (0.13) | −0.01 |
-| timers / sched | 0.97% (0.06) | 1.05% (0.10) | −0.03 |
-| memcg accounting | 0.66% (0.04) | 0.79% (0.07) | −0.03 |
-| **io_uring core** | **5.01% (0.32)** | — | +0.32 |
-| **epoll core** | — | **2.98% (0.27)** | −0.27 |
+| TCP | 22.29% (1.45) | 17.86% (1.56) | −0.12 |
+| IP / net core | 18.76% (1.22) | 15.65% (1.37) | −0.15 |
+| locks / RCU / irq / Hyper-V | 17.71% (1.15) | 16.21% (1.42) | −0.27 |
+| netfilter / NAT / SELinux | 13.61% (0.88) | 14.80% (1.30) | −0.41 |
+| other kernel | 18.58% (1.21) | 29.21% (2.56) | **−1.35** |
+| slab / page / memset | 1.85% (0.12) | 1.47% (0.13) | −0.01 |
+| timers / sched | 0.93% (0.06) | 1.01% (0.09) | −0.03 |
+| memcg accounting | 0.69% (0.04) | 0.82% (0.07) | −0.03 |
+| **io_uring core** | **5.46% (0.35)** | — | +0.35 |
+| **epoll core** | — | **2.84% (0.25)** | −0.25 |
 
 **Three things fall out of this.**
 
 **1. Three quarters of the remaining cost is a floor both implementations pay
 identically.** TCP + IP + netfilter + locks/RCU/irq + slab + timers + memcg is
-**4.86 µs of io_uring's 6.37 µs (76%)**, and 6.29 µs of epoll's 9.18 µs (68%).
+**4.92 µs of io_uring's 6.49 µs (76%)**, and 5.94 µs of epoll's 8.75 µs (68%).
 No `io_uring` feature touches this. `tcp_ack` alone is the largest single leaf
-at 3.35%, mostly `tcp_send_delayed_ack` → `sk_reset_timer` → `__mod_timer` —
+at 3.22%, mostly `tcp_send_delayed_ack` → `sk_reset_timer` → `__mod_timer` —
 timer rearming inherent to TCP on loopback, which `TCP_NODELAY` does not
 suppress since that governs the sending side.
 
-**2. The entire 2.81 µs win is the "other kernel" bucket, and it is exactly the
+**2. The entire 2.26 µs win is the "other kernel" bucket, and it is exactly the
 syscall tax the design predicts.** For epoll that bucket is dominated by
-`do_syscall_64` (3.01%), `__internal_syscall_cancel` (1.18%), `vfs_read`
-(1.01%), `sock_read_iter` (0.90%), `fdget_pos` (0.74%), `sock_poll` (0.59%),
-`sock_write_iter` + `vfs_write` (1.13%) — the VFS/syscall entry path that
-`io_uring` replaces with **0.32 µs** of `io_uring core`. The ~79x syscall
-reduction from the previous section and this 1.45 µs are the same fact measured
-two ways: once in the kernel's syscall counter, once in the kernel's own profile.
+`do_syscall_64` (2.97%), `__internal_syscall_cancel` (1.29%), `vfs_read`
+(1.01%), `sock_read_iter` (0.97%), `fdget_pos` (0.81%), `sock_poll` (0.59%),
+`sock_write_iter` + `vfs_write` (1.26%), `__file_has_perm` (0.46%) — the VFS and
+syscall-entry path that `io_uring` replaces with **0.35 µs** of `io_uring core`.
+The ~79x syscall reduction from the previous section and this 1.35 µs are the
+same fact measured two ways: once in the kernel's syscall counter, once in the
+kernel's own profile.
 
 **3. The userspace event loop is invisible.** **0.00%** of samples — below the
-sampling floor at 3,945 samples (0.025%), with neither `uring_srv` nor `main`
+sampling floor at 3,940 samples (0.025%), with neither `uring_srv` nor `main`
 appearing as a leaf. Per-CQE decode, SQE prep, and buffer recycling cost
 nothing measurable. **Any optimisation aimed at the userspace loop cannot pay.**
 
@@ -209,22 +210,42 @@ The profile was used to kill three plausible ideas before spending time on them.
 
 | candidate | premise | why the profile says no |
 |---|---|---|
-| `IORING_RECVSEND_POLL_FIRST` | skip a wasted initial `recv` that returns `EAGAIN` before arming poll | **`io_arm_poll_handler` and `io_poll_create`: 0.00% of 3,945 stacks.** All 406 `io_recv` and 3,337 `io_send` samples complete inline from `__io_issue_sqe`. Data is already queued when the SQE is issued, so there is no failed attempt to skip — the flag would push requests onto a poll path they currently bypass. Likely a regression. |
-| `IOSQE_CQE_SKIP_SUCCESS` + NOP barrier | drop 1 of 2 CQEs per transaction | Ceiling is tiny: `io_fill_cqe*` + `__io_submit_flush_completions` ≈ **0.31%** of total. Best case ~0.3% CPU for a large jump in ownership complexity. |
-| `IORING_SETUP_SQPOLL` | remove the remaining `io_uring_enter` syscalls | `__do_sys_io_uring_enter` **0.04%**, `io_cqring_wait` **0.03%**. Nothing to remove — completions are already inline. The SQ poll thread would also compete with the server for the single pinned cpu0. |
+| `IORING_RECVSEND_POLL_FIRST` | skip a wasted initial `recv` that returns `EAGAIN` before arming poll | **`io_arm_poll_handler` and `io_poll_create`: 0.00% of 3,940 stacks.** All `io_recv` samples (9.16%) complete inline from `__io_issue_sqe`, as do 85.96% of `io_send`. Data is already queued when the SQE is issued, so there is no failed attempt to skip — the flag would push requests onto a poll path they currently bypass. Likely a regression. |
+| `IOSQE_CQE_SKIP_SUCCESS` + NOP barrier | drop 1 of 2 CQEs per transaction | Ceiling is tiny: `io_fill_cqe_aux` (0.06%) + `io_req_post_cqe` (0.18%) ≈ **0.24%** of total. Best case ~0.24% CPU for a large jump in ownership complexity. |
+| `IORING_SETUP_SQPOLL` | remove the remaining `io_uring_enter` syscalls | `io_uring_submit_and_wait` **0.04%**, `io_cqring_wait` **0.01%**. Nothing to remove — completions are already inline. The SQ poll thread would also compete with the server for the single pinned cpu0. |
 
 `accept_direct` + `close_direct` remain available and correct, but they save one
 syscall per *connection*, not per transaction: not a throughput lever, only a
 tightening of the "zero syscalls in steady state" claim.
 
 The CQ is already **8,192 entries** at `ENTRIES=4096` (the kernel defaults CQ to
-2× SQ), so `IORING_SETUP_CQSIZE` at 8,192 would be a no-op. Raising it further is
-insurance against overflow at high connection counts, not a measured gain.
+2× SQ, confirmed in the `io_uring_setup` trace), so `IORING_SETUP_CQSIZE` at
+8,192 would be a no-op. Raising it further is insurance against overflow at high
+connection counts, not a measured gain.
+
+### Buffer size is not a lever
+
+`BUF_SIZE` was 512 bytes with a 64-byte payload — 8x more buffer than any
+request needs. It is now 64, matching the payload exactly. The change is a
+clarity fix, not a performance one, and the profile is why: at 64B vs 512B the
+only candidate costs are the copy (`_copy_from_iter` 0.66%, `_copy_to_iter`
+0.57% — a 64B copy either way, since size-independent) and cache footprint.
+A 64B recv writes the first 64B of its buffer and leaves the rest untouched in
+both cases, so dirty lines and faulted pages are identical. Measured across both
+sizes, the per-bucket breakdown above is unchanged within noise.
+
+What 64B *does* fix is a configuration hazard. The multishot recv is prepared
+with `len=0` ("no limit"), so the provided buffer's `io_len` is what actually
+caps the transfer — a payload larger than `BUF_SIZE` arrives as several short
+echoes. That is loud rather than silent (measured at roughly half the echoes
+mismatching, aborting the run), but it presents as content corruption rather
+than as the sizing mistake it is. Both sizes are now pinned together:
+`BUF_SIZE` in `uring_srv.c` and `MSG_SIZE` in `bench.sh`.
 
 ### The ceiling
 
-io_uring now spends **0.32 µs** per transaction on its own machinery against a
-**4.86 µs** shared socket-path floor. There is no remaining order-of-magnitude
+io_uring now spends **0.35 µs** per transaction on its own machinery against a
+**4.92 µs** shared socket-path floor. There is no remaining order-of-magnitude
 to win on the ring side for this workload; the result is close to structural.
 Further gains would have to come from the floor itself — larger payloads to
 amortise it, or a different transport — which changes the workload rather than
@@ -234,7 +255,7 @@ the event engine.
 
 ## Honest reading
 
-- The **1.42x–1.54x throughput** margin is specific to 64-byte synchronous
+- The **1.38x–1.54x throughput** margin is specific to 64-byte synchronous
   ping-pong over loopback with single-threaded servers. It does not transfer to
   streaming, large payloads, or real NICs.
 - The **~79x syscall-per-transaction** reduction is the structural result. It is
@@ -242,8 +263,8 @@ the event engine.
   this workload, and it is what would carry over — though not the magnitude of
   any throughput benefit.
 - The profile shows **76% of the remaining per-transaction cost is TCP/IP/
-  netfilter work that neither implementation controls.** The 1.4–1.5x is close
-  to the practical ceiling for this shape, not an early point on a curve.
+  netfilter work that neither implementation controls.** The result is close to
+  the practical ceiling for this shape, not an early point on a curve.
 - io_uring **loses** on this benchmark if implemented naively with one-at-a-time
   SQEs. The results above require multishot accept/recv, the provided buffer
   ring, correct buffer ownership, and correct CQE batching. See the README for

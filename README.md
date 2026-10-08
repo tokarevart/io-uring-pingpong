@@ -140,8 +140,10 @@ params.flags = IORING_SETUP_SINGLE_ISSUER
 
 - **one** multishot `accept` SQE for the whole listener — no `epoll_ctl` churn
 - **one** multishot `recv` SQE per connection, with `IOSQE_BUFFER_SELECT`
-- a **provided buffer ring** (`io_uring_setup_buf_ring`, 2048 × 512 B), so reads
-  need no per-connection buffer allocation
+- a **provided buffer ring** (`io_uring_setup_buf_ring`, 2048 × 64 B), so reads
+  need no per-connection buffer allocation. Buffer size equals the payload size
+  and both are pinned together; see
+  [Buffer size is not a lever](RESULTS.md#buffer-size-is-not-a-lever)
 - batched CQE draining — one `io_uring_enter` per wakeup, then walk every CQE
 
 #### Buffer ownership
@@ -336,28 +338,29 @@ Headline, on this box:
 
 | | epoll | io_uring |
 |---|---:|---:|
-| throughput @512 conns | 112,106 rps | **159,360 rps** (1.42x) |
-| syscalls per transaction | 2.046 | **0.026** (~79x fewer) |
+| throughput @512 conns | 114,933 rps | **161,647 rps** (1.41x) |
+| syscalls per transaction | 2.043 | **0.0260** (~79x fewer) |
 | `read`/`write` in hot path | one each per txn | **0** |
+| echoes failing content check | 0 | **0** |
 
-Server CPU was 99.0–101.3% in every run, and the client had headroom at 64 and
+Server CPU was 99.3–100.7% in every run, and the client had headroom at 64 and
 512 connections, so the server was the bottleneck throughout.
 
 ### Where the remaining time goes
 
 A CPU profile of both servers (`perf record -e cpu-clock`; this box is WSL2 and
-exposes no PMU, so `cycles` is unavailable) puts io_uring at **6.37 µs per
+exposes no PMU, so `cycles` is unavailable) puts io_uring at **6.49 µs per
 transaction**, of which:
 
-- **4.86 µs (76%) is TCP + IP + netfilter work that both implementations pay
+- **4.92 µs (76%) is TCP + IP + netfilter work that both implementations pay
   identically** and no `io_uring` feature can touch
-- **0.32 µs is `io_uring` core** — versus the ~2.8 µs of syscall and VFS entry
+- **0.35 µs is `io_uring` core** — versus the ~2.3 µs of syscall and VFS entry
   path (`do_syscall_64`, `vfs_read`, `sock_read_iter`, …) it replaces
 - **the userspace event loop measures 0.00%**, below the sampling floor
 
 The same profile **rules out three optimisations** before they are attempted:
 `IORING_RECVSEND_POLL_FIRST` (`io_arm_poll_handler` at 0.00% of stacks — recv
-always completes inline), `CQE_SKIP_SUCCESS` (completion posting is 0.31% of
+always completes inline), `CQE_SKIP_SUCCESS` (completion posting is ~0.24% of
 CPU), and `SQPOLL` (`io_uring_enter` is 0.04%). Details and the full breakdown
 in [Where the time actually goes](RESULTS.md#where-the-time-actually-goes).
 
@@ -370,7 +373,7 @@ in [Where the time actually goes](RESULTS.md#where-the-time-actually-goes).
   not transfer to streaming, large payloads, or real NICs.
 - **The result is close to structural, not an early point on a curve.** With
   76% of io_uring's per-transaction time in a socket-path floor it shares with
-  `epoll`, and only 0.32 µs of its own machinery, there is no further
+  `epoll`, and only 0.35 µs of its own machinery, there is no further
   order-of-magnitude win available on the ring side for this workload.
 - Loopback means the kernel's networking path is exercised but no NIC, no
   DMA, and no real NIC interrupt cost. On this VM, netfilter conntrack, NAT,

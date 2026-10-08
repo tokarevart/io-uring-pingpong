@@ -34,7 +34,22 @@
 #define ENTRIES 4096
 #define BUF_BGID 1
 #define BUF_NUM 2048
-#define BUF_SIZE 512
+/* Buffer size must be >= the client's payload, because the multishot recv is
+ * prepared with len=0 ("no limit") and the provided buffer's io_len is what
+ * actually caps the transfer. A smaller buffer truncates: a 128-byte request
+ * arrives as two 64-byte echoes, so the client reads a 64-byte reply that does
+ * not match what it sent.
+ *
+ * That failure is caught -- the client's echo tag check reports roughly half the
+ * echoes mismatched and aborts the run -- but it presents as content
+ * corruption rather than as the sizing mistake it actually is, which is a
+ * confusing way to learn about it. So the sizes are pinned instead: 64 here,
+ * MSG_SIZE=64 in bench.sh.
+ *
+ * There is no throughput argument for 64 over a larger size either way (see
+ * RESULTS.md), so this is purely about making a wrong configuration legible.
+ */
+#define BUF_SIZE 64
 #define DEADLINE_CHECK_EVERY 1024
 
 #define OP_ACCEPT 0ULL

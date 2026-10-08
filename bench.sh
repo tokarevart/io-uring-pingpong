@@ -52,7 +52,12 @@ PORT_START=${PORT_START:-9100}
 # too, which would make CONNS_LIST="" (used by `make strace` to skip the timing
 # matrix) silently run the full matrix instead.
 CONNS_LIST=${CONNS_LIST-"64 512 4096"}
-MSG_SIZE=${MSG_SIZE:-64}
+# Pinned, not overridable: uring_srv's provided buffers are BUF_SIZE=64 bytes, so
+# a larger payload would be split into several shorter echoes and the run would
+# abort on echo mismatches -- which is loud, but reads as content corruption
+# rather than as the sizing mistake it is. Both sides must move together, and
+# until they do this stays at 64.
+MSG_SIZE=64
 WARMUP=${WARMUP:-1}
 DURATION=${DURATION:-3}
 NODELAY=${NODELAY:-1}
