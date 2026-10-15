@@ -140,28 +140,41 @@ gained throughput from the extra workers.
 
 `strace -c` attached to the server, 64 connections, 1s window. A single point
 suffices because the *per-transaction* rate is stable across connection counts.
+This pass measures **syscall counts**, never throughput — the reason is spelled
+out after the table, and it is not a formality.
 
-**epoll** — 6,423 transactions in 1.0s, 13,111 syscalls
-**io_uring** — 109,961 transactions in 1.0s, 2,855 syscalls
+**epoll** — 6,423 transactions in the window, 13,111 syscalls
+**io_uring** — 109,961 transactions in the window, 2,855 syscalls
 
 | | epoll | io_uring |
 |---|---:|---:|
 | **syscalls per transaction** | **2.041** | **0.0260** |
 | `read`/`write` in hot path | one each per txn | **0** |
 | `io_uring_enter` | 0 | ~2,850 |
-| total | 13,111 | 2,855 |
+| syscalls in the strace window | 13,111 | 2,855 |
 | transactions in the same window | 6,423 | **109,961** |
 
-**~78x fewer syscalls per transaction**, and 4.6x fewer in total over a window
-long enough to compare rates fairly.
+**~78x fewer syscalls per transaction.** That is the *only* valid comparison
+between the two sides of this table, and the two count rows must not be divided
+into a speedup — see below for why.
 
 The structural difference: `epoll` issues exactly one `read` and one `write` per
 transaction and cannot avoid it. The `io_uring` server issues **zero**
 `read`/`write` syscalls in steady state; all data moves through the shared SQ/CQ
 rings.
 
-Under `strace`, which penalises syscall entry/exit heavily, `io_uring` served
-**17.0x** more transactions than `epoll` in the same wall-clock window.
+The two count rows above cannot be divided into a speedup, and the reason is
+the trap this measurement walks into. `strace` stops on every syscall, so its
+cost per transaction scales with syscalls per transaction. Against the clean
+benchmark, `epoll` (2.04 syscalls per txn) runs **14.7x** slower under strace
+(94,504 → 6,411 rps) while `io_uring` (0.026 syscalls per txn) slows only
+**1.27x** (139,941 → 109,901 rps). A fixed 1s window therefore reports
+**17.1x** more transactions for `io_uring` against a real throughput gap of
+**1.48x** — and that 17.1x measures strace's overhead, not the server.
+
+The per-transaction rate survives this because strace changes how *fast* syscalls
+run, not how *many* a transaction issues. That is the whole reason the syscall
+pass reports counts per transaction and is never used for throughput.
 
 The strace files are `results/bench_strace.csv` (tcp) and
 `results/udp_strace.csv` (udp); each pass cleans up only its own raw reports,
@@ -213,9 +226,13 @@ budget rather than an artefact of a capped load generator.
 | | epoll | io_uring |
 |---|---:|---:|
 | transactions in the window | 6,604 | 139,476 |
-| total syscalls | 13,326 | 2,821 |
+| syscalls in the window | 13,326 | 2,821 |
 | **syscalls per transaction** | **2.018** | **0.0202** |
 | | | **~100x fewer** |
+
+Those two count rows are strace-instrumented and, as above, are not a throughput
+comparison — here the distortion is larger still (`epoll` slows **24.1x** under
+strace, `io_uring` **1.31x**).
 
 That is a *bigger* syscall reduction than TCP's 78x — epoll still pays exactly
 two calls per datagram (`recvfrom` + `sendto`), and io_uring still pays none.

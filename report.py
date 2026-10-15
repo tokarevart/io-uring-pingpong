@@ -145,25 +145,42 @@ def render(timing, strace_csv, label):
     if not strace_csv:
         return
 
-    syscalls = defaultdict(dict)
+    # Keep BOTH the syscall count and the transaction count per (impl, conns).
+    #
+    # Only the ratio of per-transaction rates is meaningful. strace stops on
+    # every syscall, so within a fixed window the implementation that issues the
+    # most syscalls per transaction is penalised hardest: epoll (2.04 syscalls
+    # per txn) runs ~15x slower under strace, io_uring (0.026) only ~1.3x. That
+    # stretches a real 1.48x throughput gap into a 17x transaction-count gap,
+    # which measures strace's overhead, not the server.
+    counts = defaultdict(dict)
     for r in load(strace_csv):
         try:
             if r.get("syscalls") and r["syscalls"] != "NA":
-                syscalls[r["impl"]][int(r["conns"])] = int(r["syscalls"])
+                completed = int(r.get("completed") or 0)
+                counts[r["impl"]][int(r["conns"])] = (int(r["syscalls"]), completed)
         except (ValueError, KeyError, TypeError):
             continue
 
-    if len(syscalls) == 2:
-        a, b = sorted(syscalls)
-        print(f"\nsyscalls per point (from {strace_csv}):")
-        for c in sorted(set(syscalls[a]) | set(syscalls[b])):
-            va, vb = syscalls[a].get(c), syscalls[b].get(c)
-            if va and vb:
-                print(f"  conns={c:<6} {a}={va:>8,}   {b}={vb:>8,}   {va / vb:.1f}x fewer for {b}")
-            else:
-                print(f"  conns={c:<6} {a}={va or 'n/a':>8}   {b}={vb or 'n/a':>8}")
-    elif syscalls:
-        print(f"\nsyscalls recorded for only one impl: {sorted(syscalls)}")
+    if len(counts) == 2:
+        a, b = sorted(counts)
+        print(f"\nsyscalls per transaction (from {strace_csv}):")
+        for c in sorted(set(counts[a]) | set(counts[b])):
+            sa, ca = counts[a].get(c, (0, 0))
+            sb, cb = counts[b].get(c, (0, 0))
+            if not (sa and sb):
+                print(f"  conns={c:<6} no syscall data")
+                continue
+            # `completed` can be 0 (or absent) if the transaction count was not
+            # captured, which would make the per-transaction rate undefined.
+            pa = f"{sa / ca:.4f}/txn ({sa:,}/{ca:,})" if ca else "n/a"
+            pb = f"{sb / cb:.4f}/txn ({sb:,}/{cb:,})" if cb else "n/a"
+            ratio = f"{sa / ca / (sb / cb):.1f}x fewer for {b}" if (ca and cb) else "n/a"
+            print(f"  conns={c:<6} {a}={pa:>24}   {b}={pb:>24}   {ratio}")
+        print("  raw counts come from a strace-instrumented window and are not a")
+        print("  throughput comparison; only the per-transaction rate is.")
+    elif counts:
+        print(f"\nsyscalls recorded for only one impl: {sorted(counts)}")
     else:
         print(f"\nno syscall data at {strace_csv} (run: make strace)")
 
